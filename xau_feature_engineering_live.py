@@ -79,7 +79,7 @@ def build_live_features(df):
     df["vol_ratio"] = df["tick_volume"] / df["vol_ema_20"]
 
     # === 10. Clean missing values ===
-    df.fillna(method="ffill", inplace=True)
-    df.fillna(method="bfill", inplace=True)
+    df.ffill(inplace=True)
+    df.bfill(inplace=True)
 
     return df
