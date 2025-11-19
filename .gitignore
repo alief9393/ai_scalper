@@ -1,0 +1,30 @@
+# Virtual environment folders
+venv/
+env/
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Model files & weights
+*.pkl
+*.sav
+*.joblib
+
+# Data files
+*.csv
+*.xlsx
+*.mt5
+*.dat
+
+# Logs
+*.log
+logs/
+
+# OS / IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,9 @@
+numpy
+pandas
+pandas_ta
+scikit-learn
+joblib
+matplotlib
+MetaTrader5
+pytz
+python-dateutil
