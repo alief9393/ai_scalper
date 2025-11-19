@@ -22,7 +22,7 @@ from datetime import datetime, timedelta
 # ===== USER CONFIG =====
 SYMBOL = "XAUUSD"
 TIMEFRAME = mt5.TIMEFRAME_M5
-LOT_SIZE = 0.02           # Realistic for $100-$200
+LOT_SIZE = 0.05           # Realistic for $100-$200
 TP_PIPS = 1.0             # price-based like backtest
 SL_PIPS = 0.5
 MAGIC = 20251118
