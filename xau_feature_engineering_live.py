@@ -42,9 +42,15 @@ def build_live_features(df):
 
     # === 5. Bollinger Bands ===
     bb = ta.bbands(df["close"], length=20, std=2)
-    df["bb_low"] = bb["BBL_20_2.0"]
-    df["bb_mid"] = bb["BBM_20_2.0"]
-    df["bb_high"] = bb["BBU_20_2.0"]
+
+    # Cari nama kolom yang sesuai prefix
+    bb_low_col = [c for c in bb.columns if c.startswith("BBL_")][0]
+    bb_mid_col = [c for c in bb.columns if c.startswith("BBM_")][0]
+    bb_high_col = [c for c in bb.columns if c.startswith("BBU_")][0]
+
+    df["bb_low"] = bb[bb_low_col]
+    df["bb_mid"] = bb[bb_mid_col]
+    df["bb_high"] = bb[bb_high_col]
     df["bb_width"] = df["bb_high"] - df["bb_low"]
     df["bb_pos"] = (df["close"] - df["bb_low"]) / df["bb_width"]
 
