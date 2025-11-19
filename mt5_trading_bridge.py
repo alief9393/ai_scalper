@@ -39,15 +39,14 @@ def connect_mt5():
 
 
 # ===== GET LATEST DATA FROM MT5 =====
-def get_latest_data(n=200):
-    """Ambil n candle terakhir dari MT5 dan return DataFrame
-       Pastikan format kolom sama seperti dataset untuk ML (fitur lengkap)
-    """
-    utc_from = datetime.now(pytz.utc) - timedelta(minutes=n*5)
-    rates = mt5.copy_rates_from(SYMBOL, TIMEFRAME, utc_from, n)
+def get_latest_data():
+    utc_from = datetime.now(pytz.utc) - timedelta(days=30)
+    utc_to = datetime.now(pytz.utc)
+
+    rates = mt5.copy_rates_range(SYMBOL, TIMEFRAME, utc_from, utc_to)
     if rates is None:
         return None
-    
+
     df = pd.DataFrame(rates)
     df["time"] = pd.to_datetime(df["time"], unit="s")
     return df
