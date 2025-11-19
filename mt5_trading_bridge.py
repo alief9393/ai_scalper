@@ -119,7 +119,7 @@ def main():
 
         from xau_feature_engineering_live import build_live_features
 
-        df_raw = get_latest_data(n=300)
+        df_raw = get_latest_data()
         df_live = build_live_features(df_raw)
 
         signal_data = engine.predict_signal(df_live)
