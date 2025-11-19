@@ -122,7 +122,6 @@ def main():
         df_raw = get_latest_data()
         df_live = build_live_features(df_raw)
 
-        signal_data = engine.predict_signal(df_live)
         if df_live is None or len(df_live) < 50:
             print("[WARNING] MT5 data fetch issue.")
             time.sleep(CHECK_INTERVAL)
