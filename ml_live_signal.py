@@ -25,25 +25,33 @@ class MLSignalEngine:
     def predict_signal(self, df_latest):
         """
         Input:
-            df_latest => DataFrame with latest candle + full features
-                         must include same feature columns used in training
+            df_latest => DataFrame dengan full fitur (live)
         Output:
-            Dict => {"signal": "BUY"/"SELL"/"NO_TRADE", "confidence": 0.82}
+            {"signal": "BUY"/"SELL"/"NO_TRADE", "confidence": float}
         """
 
-        # Pastikan fitur lengkap dan urut
+        # Pastikan fitur urut sama
         X_live = df_latest[self.feature_names].tail(1)
         X_scaled = self.scaler.transform(X_live)
 
-        # Predict probability & class
+        # Probabilities per class
         proba = self.model.predict_proba(X_scaled)[0]
-        pred_class = self.model.predict(X_scaled)[0]
+        classes = list(self.model.classes_)  # biasanya [-1, 0, 1]
+        class_to_idx = {c: i for i, c in enumerate(classes)}
 
-        # Map confidence berdasarkan prediksi
-        class_to_idx = {c: i for i, c in enumerate(self.model.classes_)}
+        # Ambil proba sesuai label -1, 0, 1
+        p_sell  = proba[class_to_idx.get(-1, 0)]
+        p_flat  = proba[class_to_idx.get(0,  0)]
+        p_buy   = proba[class_to_idx.get(1,  0)]
+
+        # DEBUG: print probability semua kelas
+        print(f"🔎 Probabilities → SELL: {p_sell:.3f} | NO_TRADE: {p_flat:.3f} | BUY: {p_buy:.3f}")
+
+        # Prediksi kelas dominan
+        pred_class = classes[int(proba.argmax())]
         conf = proba[class_to_idx[pred_class]]
 
-        # Apply confidence filter seperti training
+        # Terapkan threshold yang sama dengan training
         if pred_class == 1 and conf >= self.conf_threshold:
             return {"signal": "BUY", "confidence": float(conf)}
 
@@ -52,7 +60,6 @@ class MLSignalEngine:
 
         else:
             return {"signal": "NO_TRADE", "confidence": float(conf)}
-
 
 # ===== Quick Test (Manual) =====
 if __name__ == "__main__":
