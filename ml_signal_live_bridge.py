@@ -357,6 +357,8 @@ def send_order(direction: str, lot: float, tp_pips: float, sl_pips: float):
     tp_price = round(tp_price, info.digits)
     sl_price = round(sl_price, info.digits)
 
+    print(f"[DEBUG] stop_level={stop_level:.3f}, price={price:.3f}, SL={sl_price}, TP={tp_price}")
+
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": SYMBOL,
