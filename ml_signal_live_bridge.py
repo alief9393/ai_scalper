@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 import MetaTrader5 as mt5
 import joblib
+import pandas_ta as ta 
 
 from feature_engineering_advanced import add_advanced_features
 
@@ -139,38 +140,74 @@ def calc_dynamic_lot(equity: float, entry_price: float) -> float:
 
 def build_features_from_candles(df_raw: pd.DataFrame) -> pd.DataFrame:
     """
-    df_raw: Data OHLCV dari MT5:
-        ['time','open','high','low','close','tick_volume', ...]
-    Return: df_features dengan semua fitur yang dibutuhkan model.
-
-    - Di sini kita pakai add_advanced_features() yang lo punya.
-    - Kalau di pipeline dataset lo ada indikator lain (EMA/RSI/etc),
-      tambahin juga di sini sebelum/atau sesudah advanced.
+    df_raw: data OHLCV dari MT5, kolom minimal:
+      ['time','open','high','low','close','tick_volume', ...]
+    Output: df_features dengan semua fitur dasar + advanced
+            (harus mengandung semua feature_names model).
     """
-
     df = df_raw.copy()
 
     # Pastikan time dalam datetime
     if not np.issubdtype(df["time"].dtype, np.datetime64):
         df["time"] = pd.to_datetime(df["time"], unit="s")
 
-    # MT5 kasih 'tick_volume', tapi advanced features butuh itu juga
-    # Kalau pipeline lama lo pakai nama lain (misal 'volume'), sesuaikan di sini.
+    # Pastikan tick_volume ada
     if "tick_volume" not in df.columns and "volume" in df.columns:
         df["tick_volume"] = df["volume"]
 
-    # ====== (Optional) tambahkan indikator basic lain di sini kalau memang
-    # ====== dipakai di training. Contoh:
-    # import pandas_ta as ta
-    # df["rsi_14"] = ta.rsi(df["close"], length=14)
-    # df["ema_20"] = ta.ema(df["close"], length=20)
-    # dst...
-    # Untuk sekarang, kita fokus ke advanced dulu.
+    # ========= BASE FEATURES (yang sekarang missing) =========
 
-    # Tambahkan advanced features (PA, VWAP, ATR, EMA trend, session flags)
+    # Returns (simple % change)
+    df["ret_1"] = df["close"].pct_change(1)
+    df["ret_3"] = df["close"].pct_change(3)
+    df["ret_6"] = df["close"].pct_change(6)
+
+    # EMAs
+    df["ema_10"] = ta.ema(df["close"], length=10)
+    df["ema_20"] = ta.ema(df["close"], length=20)
+    df["ema_50"] = ta.ema(df["close"], length=50)
+    df["ema_fast_slow_diff"] = df["ema_10"] - df["ema_50"]
+
+    # RSI
+    df["rsi_14"] = ta.rsi(df["close"], length=14)
+
+    # Bollinger Bands (20, 2)
+    bb = ta.bbands(df["close"], length=20, std=2)
+    if bb is not None:
+        df["bb_low"] = bb["BBL_20_2.0"]
+        df["bb_mid"] = bb["BBM_20_2.0"]
+        df["bb_high"] = bb["BBU_20_2.0"]
+        df["bb_width"] = (df["bb_high"] - df["bb_low"]) / (df["bb_mid"] + 1e-6)
+        df["bb_pos"] = (df["close"] - df["bb_low"]) / ((df["bb_high"] - df["bb_low"]) + 1e-6)
+
+    # ATR 14 (versi base)
+    df["atr_14"] = ta.atr(df["high"], df["low"], df["close"], length=14)
+
+    # Stochastic (k & d)
+    stoch = ta.stoch(df["high"], df["low"], df["close"], k=14, d=3)
+    if stoch is not None:
+        df["stoch_k"] = stoch["STOCHk_14_3_3"]
+        df["stoch_d"] = stoch["STOCHd_14_3_3"]
+
+    # Time features
+    df["dayofweek"] = df["time"].dt.dayofweek
+    hour = df["time"].dt.hour
+    df["hour_sin"] = np.sin(2 * np.pi * hour / 24.0)
+    df["hour_cos"] = np.cos(2 * np.pi * hour / 24.0)
+
+    # Session flags (versi base)
+    df["sess_asia"] = hour.between(0, 7).astype(int)
+    df["sess_london"] = hour.between(7, 15).astype(int)
+    df["sess_ny"] = hour.between(12, 21).astype(int)
+
+    # Volume regime
+    df["vol_ema_20"] = ta.ema(df["tick_volume"], length=20)
+    df["vol_ratio"] = df["tick_volume"] / (df["vol_ema_20"] + 1e-6)
+
+    # ========= ADVANCED FEATURES (module lo sendiri) =========
     df = add_advanced_features(df)
 
-    # Rapihin, buang bar yang masih NaN di awal
+    # Buang bar awal yang masih NaN
     df = df.dropna().reset_index(drop=True)
 
     return df

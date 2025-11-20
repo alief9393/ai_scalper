@@ -52,8 +52,8 @@ def add_advanced_features(df):
     df["ema_trend_strength"] = df["ema_fast"] - df["ema_slow"]
 
     # ===== Handle NaN =====
-    df.fillna(method="ffill", inplace=True)
-    df.fillna(method="bfill", inplace=True)
+    df.ffill(inplace=True)
+    df.bfill(inplace=True)
 
     print("[INFO] Advanced features added (PA, VWAP, EMA Trend, ATR Regime).")
     return df
