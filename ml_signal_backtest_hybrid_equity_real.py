@@ -26,7 +26,7 @@ RF_MODEL  = "rf_scalping_model_v3_balanced.pkl"
 
 # --- Date filter ---
 USE_DATE_FILTER = True
-START_DATE = "2025-10-01"
+START_DATE = "2025-11-01"
 END_DATE   = "2025-11-18"
 
 CONF_XGB = 0.50          # Confidence threshold XGB
@@ -37,7 +37,7 @@ MAX_BARS_HOLD = 10
 # Session filter
 USE_SESSION_FILTER = True
 TRADE_LONDON = True
-TRADE_NEWYORK = False
+TRADE_NEWYORK = True
 
 # Trade cooldown (bars after a trade closes)
 COOLDOWN_BARS = 3
@@ -53,7 +53,7 @@ LEVERAGE = 1000
 CONTRACT_SIZE = 100     # XAU contract size (100 oz)
 RISK_PERCENT = 5.0      # % equity per trade (risk to SL)
 MIN_LOT = 0.01
-MAX_LOT = 0.50          # safety cap (lo udah set ini)
+MAX_LOT = 1.0          # safety cap (lo udah set ini)
 MARGIN_USAGE_LIMIT = 0.8  # max 80% equity boleh dipakai jadi margin
 
 
@@ -87,6 +87,16 @@ def calc_dynamic_lot(equity, entry_price):
 
     return lot
 
+def normalize_lot(lot):
+    MIN_LOT = 0.01   
+    LOT_STEP = 0.01 
+    MAX_LOT = 100
+
+    if lot < MIN_LOT:
+        return 0.0
+
+    lot = round(lot / LOT_STEP) * LOT_STEP
+    return min(max(lot, MIN_LOT), MAX_LOT)
 
 def in_trade_session(t):
     """Filter jam trading (simple): London & NY sessions."""
@@ -200,6 +210,7 @@ for i in range(len(hybrid_signal) - MAX_BARS_HOLD):
     direction = "BUY" if signal == 1 else "SELL"
 
     lot = calc_dynamic_lot(current_equity, entry_price)
+    lot = normalize_lot(lot)
     if lot <= 0:
         continue
 
@@ -310,5 +321,5 @@ print(f"Average Profit:   {avg_profit:.3f} $/trade")
 print(f"Max Drawdown:     ${max_dd:.2f}")
 print(f"Profit Factor:    {profit_factor:.2f}")
 
-results_df.to_csv("ml_backtest_hybrid_equity_real_sessionfilter_growth.csv", index=False)
-print("\n[SAVED] → ml_backtest_hybrid_equity_real_sessionfilter_growth.csv")
+results_df.to_csv("ml_backtest_hybrid_equity_real_sessionfilter_growthv2.csv", index=False)
+print("\n[SAVED] → ml_backtest_hybrid_equity_real_sessionfilter_growthv2.csv")

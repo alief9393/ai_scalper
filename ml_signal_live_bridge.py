@@ -43,7 +43,7 @@ MAX_BARS_HOLD = 10   # di live tidak dipakai utk exit, tapi dibiarkan sama
 
 USE_SESSION_FILTER = True
 TRADE_LONDON = True
-TRADE_NEWYORK = False
+TRADE_NEWYORK = True
 COOLDOWN_BARS = 3    # berdasarkan index bar, sama kayak backtest
 
 # Account / leverage (untuk hitung lot; equity real ambil dari MT5)
@@ -51,7 +51,7 @@ LEVERAGE = 1000
 CONTRACT_SIZE = 100      # XAU 100oz
 RISK_PERCENT = 5.0
 MIN_LOT = 0.01
-MAX_LOT = 0.50
+MAX_LOT = 1.0
 MARGIN_USAGE_LIMIT = 0.8
 
 # Cost (lebih ke info/logging, bukan ngeblok eksekusi)
