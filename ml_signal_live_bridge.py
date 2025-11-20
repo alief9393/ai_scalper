@@ -382,6 +382,7 @@ def send_order(direction: str, lot: float, tp_pips: float, sl_pips: float):
 
 
 # ================= MAIN LOOP =================
+BAR_MINUTES = 5
 
 def main_loop():
     connect_to_mt5()
@@ -389,7 +390,8 @@ def main_loop():
     print(f"[INFO] Symbol {SYMBOL} digits={info.digits}, point={info.point}")
 
     last_bar_time = None
-    last_trade_bar_index = -9999
+    last_trade_bar_index = -9999   # boleh dibiarkan tapi ga kepake lagi
+    last_trade_time = None
 
     while True:
         try:
@@ -455,11 +457,13 @@ def main_loop():
                 continue
 
             # Cooldown pakai index bar (mirip backtest)
-            bar_index = len(df_feat) - 1
-            if bar_index <= last_trade_bar_index + COOLDOWN_BARS:
-                print("[FILTER] Cooldown active, skip.")
-                time.sleep(POLL_SECONDS)
-                continue
+            bar_index = len(df_feat) - 1  # boleh tetap, kalau mau buat debug
+            if last_trade_time is not None:
+                bars_since = (bar_time - last_trade_time).total_seconds() / (BAR_MINUTES * 60.0)
+                if bars_since <= COOLDOWN_BARS:
+                    print("[FILTER] Cooldown active, skip.")
+                    time.sleep(POLL_SECONDS)
+                    continue
 
             # Equity real dari MT5
             acc = mt5.account_info()
@@ -481,8 +485,9 @@ def main_loop():
             print(f"[TRADE] {direction} signal | equity={current_equity:.2f} | lot={lot:.3f}")
 
             send_order(direction, lot, TP_PIPS, SL_PIPS)
-
-            last_trade_bar_index = bar_index
+            
+            last_trade_bar_index = bar_index 
+            last_trade_time = bar_time   
 
             time.sleep(POLL_SECONDS)
 
