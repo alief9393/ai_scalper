@@ -173,12 +173,25 @@ def build_features_from_candles(df_raw: pd.DataFrame) -> pd.DataFrame:
 
     # Bollinger Bands (20, 2)
     bb = ta.bbands(df["close"], length=20, std=2)
-    if bb is not None:
-        df["bb_low"] = bb["BBL_20_2.0"]
-        df["bb_mid"] = bb["BBM_20_2.0"]
-        df["bb_high"] = bb["BBU_20_2.0"]
-        df["bb_width"] = (df["bb_high"] - df["bb_low"]) / (df["bb_mid"] + 1e-6)
-        df["bb_pos"] = (df["close"] - df["bb_low"]) / ((df["bb_high"] - df["bb_low"]) + 1e-6)
+
+    if isinstance(bb, pd.DataFrame):
+        low_col_candidates  = [c for c in bb.columns if "BBL_" in c]
+        mid_col_candidates  = [c for c in bb.columns if "BBM_" in c]
+        high_col_candidates = [c for c in bb.columns if "BBU_" in c]
+
+        low_col  = low_col_candidates[0]  if low_col_candidates  else None
+        mid_col  = mid_col_candidates[0]  if mid_col_candidates  else None
+        high_col = high_col_candidates[0] if high_col_candidates else None
+
+        if low_col and mid_col and high_col:
+            df["bb_low"]  = bb[low_col]
+            df["bb_mid"]  = bb[mid_col]
+            df["bb_high"] = bb[high_col]
+
+            df["bb_width"] = (df["bb_high"] - df["bb_low"]) / (df["bb_mid"] + 1e-6)
+            df["bb_pos"]   = (df["close"] - df["bb_low"]) / (
+                (df["bb_high"] - df["bb_low"]) + 1e-6
+            )
 
     # ATR 14 (versi base)
     df["atr_14"] = ta.atr(df["high"], df["low"], df["close"], length=14)
