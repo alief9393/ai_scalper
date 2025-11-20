@@ -50,8 +50,8 @@ COOLDOWN_BARS = 3    # berdasarkan index bar, sama kayak backtest
 LEVERAGE = 1000
 CONTRACT_SIZE = 100      # XAU 100oz
 RISK_PERCENT = 5.0
-MIN_LOT = 0.01
-MAX_LOT = 1.0
+MIN_LOT = 0.03
+MAX_LOT = 2.0
 MARGIN_USAGE_LIMIT = 0.8
 
 # Cost (lebih ke info/logging, bukan ngeblok eksekusi)
