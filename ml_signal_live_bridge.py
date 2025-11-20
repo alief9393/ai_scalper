@@ -264,8 +264,8 @@ def generate_hybrid_signal(df_features: pd.DataFrame):
         print("[ERROR] Missing features:", missing)
         return None
 
-    X = df_features[feature_names].values
-    X_scaled = scaler.transform(X)
+    X = df_features[feature_names]          # <- biarin tetap DataFrame
+    X_scaled = scaler.transform(X)          # scaler masih bisa handle DataFrame
 
     xgb_pred = xgb_model.predict(X_scaled)
     xgb_proba = xgb_model.predict_proba(X_scaled)
