@@ -240,7 +240,6 @@ feature_names = xgb_data["feature_names"]
 print(f"[INFO] Feature count: {len(feature_names)}")
 
 
-# ================= HYBRID SIGNAL =================
 
 def generate_hybrid_signal(df_features: pd.DataFrame):
     """
@@ -258,58 +257,53 @@ def generate_hybrid_signal(df_features: pd.DataFrame):
     if df_features.empty:
         return None
 
-    # Pastikan semua feature tersedia
     missing = [f for f in feature_names if f not in df_features.columns]
     if missing:
         print("[ERROR] Missing features:", missing)
         return None
 
-    X = df_features[feature_names]          # <- biarin tetap DataFrame
-    X_scaled = scaler.transform(X)          # scaler masih bisa handle DataFrame
+    X = df_features[feature_names]        
+    X_scaled = scaler.transform(X)        
 
     xgb_pred = xgb_model.predict(X_scaled)
     xgb_proba = xgb_model.predict_proba(X_scaled)
 
     i = len(df_features) - 1
-    base_cls = int(xgb_pred[i])            # 0=SELL,1=NO_TRADE,2=BUY
+    base_cls = int(xgb_pred[i])          
     base_conf = float(xgb_proba[i, base_cls])
 
     t = df_features.iloc[i]["time"]
 
-    xgb_cls = base_cls
-    xgb_conf = base_conf
     rf_cls = 1
     rf_conf = 0.0
     final_signal = 0
 
-    # Filter utama: XGB bilang no-trade / confidence kurang
     if base_cls == 1 or base_conf < CONF_XGB:
         return {
             "time": t,
             "signal": 0,
-            "xgb_cls": xgb_cls,
-            "xgb_conf": xgb_conf,
-            "rf_cls": rf_cls,
-            "rf_conf": rf_conf,
+            "xgb_cls": base_cls,
+            "xgb_conf": base_conf,
+            "rf_cls": 1,
+            "rf_conf": 0.0,
         }
 
-    # RF decide arah (0=SELL,1=NO_TRADE,2=BUY)
     rf_proba_row = rf_model.predict_proba(X_scaled[i:i+1])[0]
     rf_cls = int(np.argmax(rf_proba_row))
     rf_conf = float(rf_proba_row[rf_cls])
 
-    if rf_cls == 0:
+    if rf_cls == 0: 
         final_signal = -1
     elif rf_cls == 2:
         final_signal = 1
-    else:
+    else:  
         final_signal = 0
 
     return {
         "time": t,
         "signal": final_signal,
-        "xgb_cls": xgb_cls,
-        "xgb_conf": xgb_conf,
+        "xgb_cls": base_cls,
+        "xgb_conf": base_conf,
         "rf_cls": rf_cls,
         "rf_conf": rf_conf,
     }
