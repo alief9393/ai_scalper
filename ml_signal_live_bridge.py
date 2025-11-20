@@ -62,7 +62,7 @@ MAGIC = 987654321
 
 # True  -> hanya print signal & calon order, TIDAK kirim order ke MT5
 # False -> kirim order beneran
-USE_DEMO_MODE = True
+USE_DEMO_MODE = False
 
 
 # ================= MT5 CONNECTOR =================
