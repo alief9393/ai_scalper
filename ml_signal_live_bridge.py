@@ -314,6 +314,18 @@ def generate_hybrid_signal(df_features: pd.DataFrame):
         "rf_conf": rf_conf,
     }
 
+def normalize_lot(lot):
+    # Broker constraints
+    MIN_LOT = 0.01     # ubah ke 0.10 kalau akun raw/ecn
+    LOT_STEP = 0.01    # bisa jadi 0.10 di broker tertentu
+    MAX_LOT = 100
+
+    if lot < MIN_LOT:
+        return 0.0
+
+    # dibulatkan ke kelipatan LOT_STEP
+    lot = round(lot / LOT_STEP) * LOT_STEP
+    return min(max(lot, MIN_LOT), MAX_LOT)
 
 # ================= ORDER EXECUTION =================
 
@@ -459,6 +471,7 @@ def main_loop():
 
             entry_price = float(df_feat["close"].iloc[-1])
             lot = calc_dynamic_lot(current_equity, entry_price)
+            lot = normalize_lot(lot)
             if lot <= 0:
                 print(f"[FILTER] Lot <= 0 (equity={current_equity:.2f}), skip.")
                 time.sleep(POLL_SECONDS)
