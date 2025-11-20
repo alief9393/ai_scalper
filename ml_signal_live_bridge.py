@@ -343,12 +343,19 @@ def send_order(direction: str, lot: float, tp_pips: float, sl_pips: float):
     price = tick.ask if direction == "BUY" else tick.bid
 
     # Di backtest, TP/SL langsung: entry_price ± TP_PIPS
+    info = mt5.symbol_info(SYMBOL)
+    stop_level = info.trade_stops_level * info.point  # minimum distance
+
     if direction == "BUY":
-        tp_price = price + tp_pips
-        sl_price = price - sl_pips
+        tp_price = price + max(TP_PIPS, stop_level)
+        sl_price = price - max(SL_PIPS, stop_level)
     else:
-        tp_price = price - tp_pips
-        sl_price = price + sl_pips
+        tp_price = price - max(TP_PIPS, stop_level)
+        sl_price = price + max(SL_PIPS, stop_level)
+
+    # Normalisasi ke harga sesuai digits
+    tp_price = round(tp_price, info.digits)
+    sl_price = round(sl_price, info.digits)
 
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
