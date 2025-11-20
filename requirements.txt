@@ -7,3 +7,4 @@ matplotlib
 MetaTrader5
 pytz
 python-dateutil
+imbalanced-learn
