@@ -18,6 +18,9 @@ Final signal format:
 import pandas as pd
 import numpy as np
 import joblib
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+
 
 # ========= CONFIG =========
 CSV_INPUT = "xau_M5_ml_dataset_ADV.csv"
@@ -26,23 +29,21 @@ RF_MODEL  = "rf_direction_model_v5_realistic_fixed.pkl"
 
 # --- Date filter ---
 USE_DATE_FILTER = True
-START_DATE = "2025-01-01"
+START_DATE = "2025-10-01"
 END_DATE   = "2025-11-18"
 
-TP_PIPS = 2.0
-SL_PIPS = 1.0
+CONF_XGB = 0.30         # Confidence threshold XGB
+TP_PIPS = 1.0
+SL_PIPS = 0.5
 MAX_BARS_HOLD = 10
 
 # Session filter
-USE_SESSION_FILTER = False
+USE_SESSION_FILTER = True
 TRADE_LONDON = True
 TRADE_NEWYORK = True
 
 # Trade cooldown (bars after a trade closes)
 COOLDOWN_BARS = 3
-
-USE_FIXED_LOT = False
-FIX_LOT = 0.01
 
 # Exness-like cost
 hidden_spread_per_001 = 0.037
@@ -50,50 +51,50 @@ commission_per_001    = 0.06
 cost_per_001 = hidden_spread_per_001 + commission_per_001   # per 0.01 lot
 
 # Account / leverage setup
-START_BALANCE = 50.0
+START_BALANCE = 20.0
 LEVERAGE = 1000
 CONTRACT_SIZE = 100     # XAU contract size (100 oz)
-RISK_PERCENT = 3.0      # % equity per trade (risk to SL)
+RISK_PERCENT = 5.0      # % equity per trade (risk to SL)
 MIN_LOT = 0.01
-MAX_LOT = 1.0           # safety cap
+MAX_LOT = 1.0          # safety cap (lo udah set ini)
 MARGIN_USAGE_LIMIT = 0.8  # max 80% equity boleh dipakai jadi margin
-MAX_FORCED_RISK_PERCENT = 10.0
 
 
 def calc_dynamic_lot(equity, entry_price):
     """Hitung lot berdasarkan risk per trade & leverage/margin."""
-    # Mode FIXED LOT (untuk analisa pure edge tanpa compounding)
-    if USE_FIXED_LOT:
-        return FIX_LOT
-
     if equity <= 0:
         return 0.0
 
+    # 0.01 lot XAU ≈ $1 per 1.0 "pip" (move)
     pip_value_per_001 = 1.0  # $ per pip per 0.01 lot
 
     risk_amount = equity * (RISK_PERCENT / 100.0)
-    loss_per_001 = SL_PIPS * pip_value_per_001
+    loss_per_001 = SL_PIPS * pip_value_per_001  # loss jika SL kena per 0.01 lot
 
     if loss_per_001 <= 0:
         return 0.0
 
+    # Berapa unit 0.01 lot yang boleh (berdasarkan risk)
     units_001 = risk_amount / loss_per_001
     lot_by_risk = units_001 * 0.01
 
+    # Margin-based max lot
+    # Margin = lot * CONTRACT_SIZE * price / LEVERAGE
     max_lot_by_margin = (equity * MARGIN_USAGE_LIMIT) * LEVERAGE / (CONTRACT_SIZE * entry_price)
 
     lot = min(lot_by_risk, max_lot_by_margin, MAX_LOT)
     lot = max(lot, 0.0)
 
     if lot < MIN_LOT:
+        if equity < 200:
+            return MIN_LOT
         return 0.0
 
     return lot
 
-
 def normalize_lot(lot):
-    MIN_LOT = 0.01
-    LOT_STEP = 0.01
+    MIN_LOT = 0.01   
+    LOT_STEP = 0.01 
     MAX_LOT = 100
 
     if lot < MIN_LOT:
@@ -102,16 +103,11 @@ def normalize_lot(lot):
     lot = round(lot / LOT_STEP) * LOT_STEP
     return min(max(lot, MIN_LOT), MAX_LOT)
 
-
 def in_trade_session(t):
     """Filter jam trading (simple): London & NY sessions."""
     if not USE_SESSION_FILTER:
         return True
-
-    # Pastikan selalu jadi pandas.Timestamp, entah inputnya Timestamp atau numpy.datetime64
-    t = pd.Timestamp(t)
     hour = t.hour  # asumsi timezone sama dengan data CSV (broker time)
-
     in_london = 7 <= hour < 17   # approx London session
     in_ny     = 12 <= hour < 22  # approx New York session
 
@@ -120,7 +116,6 @@ def in_trade_session(t):
     if TRADE_NEWYORK and in_ny:
         return True
     return False
-
 
 
 print("[INFO] Loading models & dataset...")
@@ -138,13 +133,6 @@ else:
     print("[INFO] Date filter OFF: using full dataset")
     print(f"[INFO] Total rows: {len(df)}")
 
-# Pre-cache columns as numpy arrays (lebih cepat di loop)
-times = df["time"].values
-open_prices = df["open"].values
-high_prices = df["high"].values
-low_prices  = df["low"].values
-close_prices = df["close"].values  # sama dengan 'prices'
-
 xgb_data = joblib.load(XGB_MODEL)
 rf_data  = joblib.load(RF_MODEL)
 
@@ -155,9 +143,7 @@ feature_names = xgb_data["feature_names"]
 
 X = df[feature_names]
 X_scaled = scaler.transform(X)
-X_raw = X.values  # cache sekali untuk RF
-
-prices = close_prices  # alias
+prices = df["close"].values
 
 # ========= HYBRID SIGNAL + CONFIDENCE LOGGING =========
 print("[INFO] Generating hybrid signals...")
@@ -165,51 +151,44 @@ print("[INFO] Generating hybrid signals...")
 xgb_pred = xgb_model.predict(X_scaled)             # 0=SELL,1=NO_TRADE,2=BUY
 xgb_proba = xgb_model.predict_proba(X_scaled)      # [N, 3]
 
-# >>> Percepat RF: sekali predict_proba untuk semua bar <<<
-rf_proba_all = rf_model.predict_proba(X_raw)       # shape [N, 2]
-rf_pred_all = rf_proba_all.argmax(axis=1)          # 0/1
+hybrid_signal = np.zeros(len(xgb_pred), dtype=int)  # -1,0,1
+xgb_conf_arr = np.zeros(len(xgb_pred))
+xgb_cls_arr = np.zeros(len(xgb_pred), dtype=int)
+rf_cls_arr = np.zeros(len(xgb_pred), dtype=int)
+rf_conf_arr = np.zeros(len(xgb_pred))
 
-n = len(xgb_pred)
-hybrid_signal = np.zeros(n, dtype=int)  # -1,0,1
-xgb_conf_arr = np.zeros(n)
-xgb_cls_arr = np.zeros(n, dtype=int)
-rf_cls_arr = np.zeros(n, dtype=int)
-rf_conf_arr = np.zeros(n)
-
-CONF_XGB = 0.50      # bisa lo tuning nanti (0.45–0.55)
-RF_CONF_MIN = 0.55   # minimum keyakinan RF
-
-for i in range(n):
-    base_cls = int(xgb_pred[i])        # 0,1,2
+for i in range(len(xgb_pred)):
+    base_cls = int(xgb_pred[i])      # 0,1,2
     base_conf = float(xgb_proba[i, base_cls])
 
     xgb_cls_arr[i] = base_cls
     xgb_conf_arr[i] = base_conf
 
-    # 1) Kalau XGB bilang NO_TRADE dengan percaya diri -> skip total
+    # ===== Hybrid Decision v2 =====
     if base_cls == 1 and base_conf >= CONF_XGB:
+        # XGB confident NO_TRADE → Skip trade
         continue
 
-    # 2) Kalau XGB bilang SELL/BUY tapi confidence lemah -> skip juga
-    if base_cls != 1 and base_conf < CONF_XGB:
+    # For BUY / SELL with strong confidence → follow XGB
+    if base_cls in [0, 2] and base_conf >= CONF_XGB:
+        hybrid_signal[i] = -1 if base_cls == 0 else 1
         continue
 
-    # 3) Kalau XGB bilang NO_TRADE tapi ragu (conf < threshold),
-    #    kita masih boleh kasih ke RF untuk decide arah.
+    # Otherwise → uncertain or NO_TRADE → let RF decide direction
+    rf_proba_row = rf_model.predict_proba(X_scaled[i:i+1])[0]
+    rf_cls = int(np.argmax(rf_proba_row))
+    rf_conf = float(rf_proba_row[rf_cls])
 
-    # === RF: direction only (0=SELL, 1=BUY), pakai hasil vectorized ===
-    rf_cls = int(rf_pred_all[i])             # 0 / 1
-    rf_conf = float(rf_proba_all[i, rf_cls])
+    RF_CONF_MIN = 0.60  # Threshold RF, bisa tuning
 
-    rf_cls_arr[i] = rf_cls
-    rf_conf_arr[i] = rf_conf
+    # Final mapping with RF confidence filtering
+    if rf_cls == 0 and rf_conf >= RF_CONF_MIN:
+        hybrid_signal[i] = -1
+    elif rf_cls == 2 and rf_conf >= RF_CONF_MIN:
+        hybrid_signal[i] = 1
+    else:
+        hybrid_signal[i] = 0
 
-    # Filter RF yang ragu -> NO_TRADE
-    if rf_conf < RF_CONF_MIN:
-        continue
-
-    # Final mapping
-    hybrid_signal[i] = -1 if rf_cls == 0 else 1
 
 print("[INFO] Hybrid signal distribution (final):")
 unique, counts = np.unique(hybrid_signal, return_counts=True)
@@ -223,27 +202,22 @@ max_dd = 0.0
 results = []
 last_trade_exit_idx = -9999
 
-len_prices = len(prices)
-
-for i in range(len_prices - MAX_BARS_HOLD):
+for i in range(len(hybrid_signal) - MAX_BARS_HOLD):
     signal = hybrid_signal[i]
     if signal == 0:
         continue
 
     # Session filter
-    current_time = times[i]
+    current_time = df.loc[i, "time"]
     if not in_trade_session(current_time):
         continue
 
-    # Trade cooldown
+    # Trade cooldown (skip jika belum lewat COOLDOWN_BARS dari trade sebelumnya)
     if i <= last_trade_exit_idx + COOLDOWN_BARS:
         continue
 
     current_equity = equity[-1]
-    if i + 1 >= len_prices:
-        break
-
-    entry_price = open_prices[i + 1]
+    entry_price = prices[i]
     direction = "BUY" if signal == 1 else "SELL"
 
     lot = calc_dynamic_lot(current_equity, entry_price)
@@ -263,21 +237,20 @@ for i in range(len_prices - MAX_BARS_HOLD):
     exit_price = entry_price
     j = i  # init j buat fallback
 
-    upper_j = min(i + MAX_BARS_HOLD, len_prices)
-    for j in range(i + 1, upper_j):
-        high = high_prices[j]
-        low = low_prices[j]
+    for j in range(i+1, min(i + MAX_BARS_HOLD, len(prices))):
+        high = df.loc[j, "high"]
+        low = df.loc[j, "low"]
 
         if direction == "BUY":
-            if low <= sl_level:        # SL selalu dicek dulu
-                hit = "SL"; exit_price = sl_level; break
             if high >= tp_level:
                 hit = "TP"; exit_price = tp_level; break
-        else:  # SELL
-            if high >= sl_level:       # Sama, cek SL dulu
+            if low <= sl_level:
                 hit = "SL"; exit_price = sl_level; break
+        else:
             if low <= tp_level:
                 hit = "TP"; exit_price = tp_level; break
+            if high >= sl_level:
+                hit = "SL"; exit_price = sl_level; break
 
     # Raw pip profit
     if hit == "TP":
@@ -311,7 +284,7 @@ for i in range(len_prices - MAX_BARS_HOLD):
 
     results.append([
         i,
-        times[i],
+        df.loc[i, "time"],
         direction,
         lot,
         entry_price,
@@ -359,5 +332,5 @@ print(f"Average Profit:   {avg_profit:.3f} $/trade")
 print(f"Max Drawdown:     ${max_dd:.2f}")
 print(f"Profit Factor:    {profit_factor:.2f}")
 
-results_df.to_csv("ml_backtest_hybrid_equity_real_realistisHybrid.csv", index=False)
-print("\n[SAVED] → ml_backtest_hybrid_equity_real_realistisHybrid.csv")
+results_df.to_csv("ml_backtest_hybrid_equity_real_override.csv", index=False)
+print("\n[SAVED] → ml_backtest_hybrid_equity_real_override.csv")

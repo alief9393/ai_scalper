@@ -41,7 +41,7 @@ TP_PIPS = 1.0
 SL_PIPS = 0.5
 MAX_BARS_HOLD = 10   # di live tidak dipakai utk exit, tapi dibiarkan sama
 
-USE_SESSION_FILTER = True
+USE_SESSION_FILTER = False
 TRADE_LONDON = True
 TRADE_NEWYORK = True
 COOLDOWN_BARS = 3    # berdasarkan index bar, sama kayak backtest
