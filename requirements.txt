@@ -2,9 +2,15 @@ numpy
 pandas
 pandas_ta
 scikit-learn
+imbalanced-learn
 joblib
 matplotlib
 MetaTrader5
 pytz
 python-dateutil
-imbalanced-learn
+configparser
+
+# Deep Learning (LSTM / TensorFlow-based models)
+torch               # penting, karena kamu pakai torch LSTM
+torchaudio          # optional (boleh hapus kalau nggak perlu)
+torchvision         # optional (boleh hapus kalau nggak perlu)
