@@ -1,10 +1,11 @@
 # live_engine_lstm_intraday.py
 #
-# DL Intraday v1 Live Engine (XAUUSD M15, LSTM + ATR SL/TP)
+# DL Intraday v1 Live Engine (XAUUSD M15, LSTM + ATR SL/TP, Dynamic Lot 1% Risk)
 # - Connect MT5
 # - Ambil M15/H1/D1
 # - Bangun fitur (sama seperti training pipeline)
 # - LSTM inference -> signal + SL/TP (ATR 1.2 / 2.0)
+# - Hitung lot dinamis berdasarkan 1% equity & SL distance
 # - Kirim order (kalau DRY_RUN=False)
 #
 # NOTE:
@@ -13,6 +14,7 @@
 
 import time
 from datetime import datetime
+import configparser
 
 import numpy as np
 import pandas as pd
@@ -24,27 +26,48 @@ from features_intraday import add_m15_features, add_h1_context, add_daily_contex
 
 # =============== CONFIG =====================
 
-SYMBOL    = "XAUUSD"          # sesuaikan dengan nama simbol di MT5
-TIMEFRAME = mt5.TIMEFRAME_M15
+cfg = load_config()
 
-DATA_META_FILE = "dl_intraday_dataset_seq64.npz"
-MODEL_PATH     = "lstm_intraday_best.pt"
+SYMBOL       = cfg["MT5"].get("SYMBOL", "XAUUSD")
+MAGIC_NUMBER = cfg["MT5"].getint("MAGIC_NUMBER", 987654)
+DRY_RUN      = cfg["MT5"].getboolean("DRY_RUN", True)
 
-# Threshold final DL Intraday v1
-THR_LONG  = 0.70
-THR_SHORT = 0.30
+MODEL_PATH     = cfg["MODEL"].get("MODEL_PATH")
+DATA_META_FILE = cfg["MODEL"].get("DATA_META_FILE")
+THR_LONG       = cfg["MODEL"].getfloat("THR_LONG")
+THR_SHORT      = cfg["MODEL"].getfloat("THR_SHORT")
 
-# ATR SL/TP config (best grid)
-ATR_COL      = "atr_14_m15"
-ATR_MULT_SL  = 1.2    # SL = 1.2 * ATR_M15
-RR_TP        = 2.0    # TP = 2.0 * SL = 2.4 * ATR_M15
+ATR_COL      = cfg["ATR_SLTP"].get("ATR_COL")
+ATR_MULT_SL  = cfg["ATR_SLTP"].getfloat("ATR_MULT_SL")
+RR_TP        = cfg["ATR_SLTP"].getfloat("RR_TP")
 
-LOT_SIZE     = 0.01   # default lot untuk 1 posisi
-MAGIC_NUMBER = 987654  # bebas tapi unik untuk EA ini
+RISK_PER_TRADE = cfg["LOTS"].getfloat("RISK_PER_TRADE")
+MIN_LOT        = cfg["LOTS"].getfloat("MIN_LOT")
+MAX_LOT        = cfg["LOTS"].getfloat("MAX_LOT")
+
+COMMISSION_PER_001 = cfg["COST_SIMULATION"].getfloat("COMMISSION_PER_001")
+SPREAD_HIDDEN_USD  = cfg["COST_SIMULATION"].getfloat("SPREAD_HIDDEN_USD")
+EST_COST_PER_TRADE_001 = COMMISSION_PER_001 + SPREAD_HIDDEN_USD
+
+TIMEFRAME_MAP = {
+    "M1": mt5.TIMEFRAME_M1,
+    "M5": mt5.TIMEFRAME_M5,
+    "M15": mt5.TIMEFRAME_M15,
+    "M30": mt5.TIMEFRAME_M30,
+    "H1": mt5.TIMEFRAME_H1,
+    "D1": mt5.TIMEFRAME_D1
+}
+
+TIMEFRAME = TIMEFRAME_MAP.get(cfg["MT5"].get("TIMEFRAME", "M15"), mt5.TIMEFRAME_M15)
 
 DRY_RUN      = True   # True: hanya log, tidak kirim order. False: kirim order beneran.
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Akan diisi setelah connect_mt5
+CONTRACT_SIZE = 100.0
+SYMBOL_INFO = None
+
 
 # =============== MODEL DEF ==================
 
@@ -97,6 +120,8 @@ def load_meta_and_model():
 
 
 def connect_mt5():
+    global CONTRACT_SIZE, SYMBOL_INFO
+
     if not mt5.initialize():
         raise RuntimeError(f"MT5 initialize() failed: {mt5.last_error()}")
     print("[INFO] Connected to MT5")
@@ -107,7 +132,20 @@ def connect_mt5():
 
     if not symbol_info.visible:
         mt5.symbol_select(SYMBOL, True)
+
+    SYMBOL_INFO = symbol_info
+
+    # Ambil contract size dari broker (misal 100 oz per 1 lot)
+    if symbol_info.trade_contract_size > 0:
+        CONTRACT_SIZE = float(symbol_info.trade_contract_size)
+    else:
+        CONTRACT_SIZE = 100.0  # fallback
+
     print("[INFO] Symbol ready:", SYMBOL)
+    print("       contract_size:", CONTRACT_SIZE)
+    print("       volume_min    :", symbol_info.volume_min,
+          "volume_max:", symbol_info.volume_max,
+          "volume_step:", symbol_info.volume_step)
 
 
 def get_latest_m15_df(n_bars=500):
@@ -120,6 +158,10 @@ def get_latest_m15_df(n_bars=500):
     df = df.sort_values("time").reset_index(drop=True)
     return df
 
+def load_config():
+    cfg = configparser.ConfigParser()
+    cfg.read("dl_live_config.ini")  # pastikan filenya ada di folder yang sama
+    return cfg
 
 def get_latest_h1_df(n_bars=300):
     rates = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_H1, 0, n_bars)
@@ -153,6 +195,57 @@ def get_symbol_tick():
 def has_open_position():
     positions = mt5.positions_get(symbol=SYMBOL)
     return positions is not None and len(positions) > 0
+
+
+def get_account_equity():
+    acc = mt5.account_info()
+    if acc is None:
+        raise RuntimeError("account_info() failed")
+    return float(acc.equity)
+
+
+def clamp_lot_to_symbol(lot):
+    """Clamp lot ke [MIN_LOT, MAX_LOT] dan batas broker (volume_min, volume_max)."""
+    if SYMBOL_INFO is None:
+        return lot
+
+    lot = max(lot, MIN_LOT)
+    lot = min(lot, MAX_LOT)
+
+    vol_min = SYMBOL_INFO.volume_min
+    vol_max = SYMBOL_INFO.volume_max
+    vol_step = SYMBOL_INFO.volume_step
+
+    # clamp ke aturan broker
+    lot = max(lot, vol_min)
+    lot = min(lot, vol_max)
+
+    # snap ke step
+    steps = round(lot / vol_step)
+    lot = steps * vol_step
+
+    return lot
+
+
+def calculate_dynamic_lot(sl_dist):
+    """
+    Hitung lot berdasarkan:
+      - RISK_PER_TRADE dari equity
+      - SL distance (sl_dist) dalam harga
+      - CONTRACT_SIZE
+    """
+    if sl_dist <= 0:
+        return 0.0
+
+    equity = get_account_equity()
+    risk_amount = equity * RISK_PER_TRADE
+
+    # PnL 1 lot ketika SL kena: sl_dist * CONTRACT_SIZE
+    # => lot = risk_amount / (sl_dist * CONTRACT_SIZE)
+    raw_lot = risk_amount / (sl_dist * CONTRACT_SIZE)
+
+    lot = clamp_lot_to_symbol(raw_lot)
+    return lot
 
 
 def send_order(direction, volume, entry_price, sl_price, tp_price):
@@ -238,7 +331,7 @@ def infer_signal(model, X, last_row, bid, ask):
         prob = torch.softmax(logits, dim=1)
         proba_up = float(prob[0, 1].cpu().item())
 
-    # Signal
+    # Tentukan arah sinyal
     if proba_up >= THR_LONG:
         signal = 1
     elif proba_up <= THR_SHORT:
@@ -246,7 +339,7 @@ def infer_signal(model, X, last_row, bid, ask):
     else:
         signal = 0
 
-    # Entry price (real: BUY di Ask, SELL di Bid)
+    # Entry price (BUY di Ask, SELL di Bid)
     if signal == 1:
         entry_price = float(ask)
         direction_str = "LONG"
@@ -266,6 +359,7 @@ def infer_signal(model, X, last_row, bid, ask):
     if signal != 0:
         if ATR_COL not in last_row.index:
             raise ValueError(f"{ATR_COL} tidak ada di live features")
+
         atr_val = float(last_row[ATR_COL])
         sl_dist = ATR_MULT_SL * atr_val
         tp_dist = RR_TP * sl_dist
@@ -299,6 +393,9 @@ def main_loop():
     connect_mt5()
 
     print("[INFO] Starting main loop...")
+    print(f"[INFO] Risk per trade: {RISK_PER_TRADE * 100:.1f}% of equity")
+    print(f"[INFO] Lot bounds: MIN_LOT={MIN_LOT}, MAX_LOT={MAX_LOT}")
+
     last_bar_time = None
 
     while True:
@@ -337,11 +434,26 @@ def main_loop():
                 print(f"  SL price     : {result['sl_price']:.2f}")
                 print(f"  TP price     : {result['tp_price']:.2f}")
 
+                if result["sl_dist"] is None or result["sl_dist"] <= 0:
+                    print("  -> SL distance invalid, skip trade.")
+                    time.sleep(5)
+                    continue
+
+                lot = calculate_dynamic_lot(result["sl_dist"])
+                if lot <= 0:
+                    print("  -> Calculated lot <= 0, skip trade.")
+                    time.sleep(5)
+                    continue
+
+                est_cost = EST_COST_PER_TRADE_001 * (lot / 0.01)
+                print(f"  Dynamic lot  : {lot:.3f}")
+                print(f"  Est. cost/trade (lot {lot:.3f}) ~ {est_cost:.3f} USD")
+
                 if has_open_position():
                     print("  -> Existing position detected, skip new order.")
                 else:
                     print("  -> Sending order..." if not DRY_RUN else "  -> DRY_RUN: would send order now.")
-                    send_order(result["direction"], LOT_SIZE, result["entry_price"],
+                    send_order(result["direction"], lot, result["entry_price"],
                                result["sl_price"], result["tp_price"])
 
             time.sleep(5)
