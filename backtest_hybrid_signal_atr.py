@@ -4,18 +4,19 @@ import argparse
 import pandas_ta as ta
 
 # ================== CONFIG ==================
-INPUT_FILE = "XAUUSD_M15_WITH_DL_SIGNALS_FULL.csv"
+INPUT_FILE = "XAUUSD_M15_WITH_HYBRID_SIGNALS_FULL.csv"
 
-HORIZON = 3
+HORIZON = 3  # sama seperti labeling
 
 ATR_COL = "atr_14_m15"
 ATR_MULT_SL = 1.2
-RR_TP = 2.0
+RR_TP = 2.0  # fallback kalau dynamic TP dimatikan
 
-USE_PROBA_CONF_FILTER = True
-PROBA_CONF_MARGIN = 0.25
+# (Confidence filter per-model TIDAK dipakai lagi, kita pakai Hybrid Confidence)
+USE_PROBA_CONF_FILTER = False
+PROBA_CONF_MARGIN = 0.25  # kalau mau dipakai lagi
 
-# Dynamic TP (RR tergantung ADX + MTF trend)
+# Dynamic TP (RR tergantung ADX + MTF trend, lalu dimodif oleh Hybrid Strength)
 USE_DYNAMIC_TP = True
 RR_TP_BASE = 2.0
 ADX_TP_MED = 20.0
@@ -33,9 +34,9 @@ RISK_PER_TRADE = 0.01  # fallback jika dynamic risk dimatikan
 
 # Dynamic risk (persentase risk per trade adaptif terhadap ADX + drawdown)
 USE_DYNAMIC_RISK = True
-BASE_RISK_PCT = 0.0200  # 1.25% base (sebelum throttle)
-MIN_RISK_PCT = 0.10     # 4%
-MAX_RISK_PCT = 0.15     # 8%
+BASE_RISK_PCT = 0.0200  # 2.0% base (sebelum throttle)
+MIN_RISK_PCT = 0.05     # 10%
+MAX_RISK_PCT = 0.10     # 15%
 
 # Market model XAUUSD
 CONTRACT_SIZE = 100.0
@@ -65,6 +66,21 @@ MTF_TREND_COL = "trend_h1_dir"
 H1_EMA_FAST = 50
 H1_EMA_SLOW = 200
 
+# ======== PIP & SLIPPAGE MODEL (EXNESS RULE) ========
+PIP_SIZE = 0.01  # 1 pip XAUUSD = 0.01 harga
+
+# nilai pip per 0.01 lot
+PIP_VALUE_PER_001 = PIP_SIZE * CONTRACT_SIZE * 0.01  # = 0.01 USD/pip (0.01 lot)
+
+# spread dalam pip, berdasarkan cost spread broker
+SPREAD_PIPS = SPREAD_HIDDEN_USD / PIP_VALUE_PER_001  # ~3.7 pip
+
+# rule exness: slippage-free 0 – 3x spread, kita ambil expected ~0.5 dari max
+MAX_SLIPPAGE_PIPS = 3.0 * SPREAD_PIPS         # ~11 pip
+AVG_SLIPPAGE_PIPS = 0.5 * MAX_SLIPPAGE_PIPS   # ~5.5 pip (dipakai buat backtest)
+
+
+# ============ SESSION & REGIME ============
 
 def in_liquid_session(ts: pd.Timestamp) -> bool:
     if pd.isna(ts):
@@ -98,7 +114,51 @@ def passes_regime_filters(row: pd.Series) -> bool:
     return True
 
 
+# ============ HYBRID CONFIDENCE ============
+
+def get_hybrid_conf_group(row: pd.Series, direction: int):
+    """
+    Hitung strength & confidence group berdasarkan dl_proba_up + xgb_proba_up.
+    direction: 1 (LONG) atau -1 (SHORT)
+    Return: (group, risk_mult, rr_mult)
+    """
+    dl_p = row.get("dl_proba_up", np.nan)
+    xgb_p = row.get("xgb_proba_up", np.nan)
+
+    if np.isnan(dl_p) or np.isnan(xgb_p):
+        return "UNKNOWN", 1.0, 1.0
+
+    if direction == 1:
+        dl_edge = dl_p - 0.5
+        xgb_edge = xgb_p - 0.5
+    else:
+        dl_edge = 0.5 - dl_p
+        xgb_edge = 0.5 - xgb_p
+
+    # Kalau salah satu model sebenarnya kontra arah -> DISAGREE
+    if dl_edge < 0 or xgb_edge < 0:
+        return "DISAGREE", 0.0, 0.0
+
+    # Strength = rata-rata edge dua model
+    strength = 0.5 * dl_edge + 0.5 * xgb_edge
+
+    if strength >= 0.25:
+        # Keduanya cukup jauh dari 0.5 (~>= 0.75)
+        return "A_STRONG", 1.5, 1.15
+    elif strength >= 0.15:
+        # Confidence moderat (~>= 0.65)
+        return "B_MODERATE", 1.0, 1.00
+    else:
+        return "C_WEAK", 0.0, 0.0
+
+
+# ============ RR & RISK CORE (ADX + DD) ============
+
 def get_rr_tp_for_row(row: pd.Series, direction: int) -> float:
+    """
+    RR base berdasarkan ADX + MTF trend.
+    (Nanti masih dikali lagi oleh hybrid RR multiplier.)
+    """
     if not USE_DYNAMIC_TP:
         return RR_TP
 
@@ -121,10 +181,9 @@ def get_rr_tp_for_row(row: pd.Series, direction: int) -> float:
     return rr
 
 
-def get_risk_pct_for_row(row: pd.Series, dd_frac: float | None) -> float:
+def get_risk_pct_core(row: pd.Series, dd_frac: float | None) -> float:
     """
-    Risk% final = risk_core(ADX) * dd_factor(drawdown), lalu di-clamp MIN/MAX.
-    dd_frac: (balance - peak_balance) / peak_balance  (<= 0 saat DD)
+    Risk core berdasarkan ADX + drawdown (tanpa hybrid multiplier).
     """
     if not USE_DYNAMIC_RISK:
         return RISK_PER_TRADE
@@ -153,17 +212,15 @@ def get_risk_pct_for_row(row: pd.Series, dd_frac: float | None) -> float:
     if dd_frac is None:
         dd_factor = 1.0
     else:
-        # dd_frac = 0    -> di ATH (no DD)
-        # dd_frac = -0.03 -> DD 3%, dst
         if dd_frac >= -0.03:        # DD < 3% → equity sehat, gas dikit
             dd_factor = 1.1
-        elif dd_frac >= -0.07:      # DD 3–7% → sedikit defensive
+        elif dd_frac >= -0.07:      # 3–7% → defensive ringan
             dd_factor = 0.9
-        elif dd_frac >= -0.15:      # DD 7–15% → lebih kecil
+        elif dd_frac >= -0.15:      # 7–15%
             dd_factor = 0.6
-        elif dd_frac >= -0.25:      # DD 15–25% → sangat kecil
+        elif dd_frac >= -0.25:      # 15–25%
             dd_factor = 0.3
-        else:                       # DD > 25% → practically stop
+        else:                       # >25%
             dd_factor = 0.0
 
     risk = risk_core * dd_factor
@@ -171,6 +228,8 @@ def get_risk_pct_for_row(row: pd.Series, dd_frac: float | None) -> float:
     risk = min(risk, MAX_RISK_PCT)
     return risk
 
+
+# ============ TRADE SIMULATION ============
 
 def simulate_trade_path(
     df: pd.DataFrame,
@@ -182,45 +241,61 @@ def simulate_trade_path(
     n = len(df)
     row_decision = df.iloc[i]
 
+    # Regime filter dulu
     if not passes_regime_filters(row_decision):
         return None, balance, i + 1, False
 
-    sig = int(row_decision.get("dl_signal", 0))
-    proba_up = row_decision.get("dl_proba_up", np.nan)
-    atr_val = row_decision.get(ATR_COL, np.nan)
-
-    if sig == 0 or np.isnan(proba_up) or np.isnan(atr_val) or i + 1 >= n:
+    # Gunakan hybrid_signal sebagai arah final
+    sig = int(row_decision.get("hybrid_signal", 0))
+    if sig == 0 or i + 1 >= n:
         return None, balance, i + 1, False
 
-    if USE_PROBA_CONF_FILTER:
-        conf = abs(proba_up - 0.5)
-        if conf < PROBA_CONF_MARGIN:
-            return None, balance, i + 1, False
+    atr_val = row_decision.get(ATR_COL, np.nan)
+    if np.isnan(atr_val):
+        return None, balance, i + 1, False
 
+    # Arah trade
     direction = 1 if sig == 1 else -1
 
-    if USE_MTF_FILTER:
-        trend_dir = row_decision.get(MTF_TREND_COL, 0)
-        if not (pd.isna(trend_dir) or trend_dir == 0):
-            if int(trend_dir) != direction:
-                return None, balance, i + 1, False
+    # 🔥 HYBRID CONFIDENCE FILTER + RISK/RR MULT
+    conf_group, risk_mult, rr_mult = get_hybrid_conf_group(row_decision, direction)
 
+    if conf_group in ("DISAGREE", "C_WEAK"):
+        # lemah / beda arah -> skip
+        return None, balance, i + 1, False
+
+    # Entry index = NEXT BAR -> pure out-of-sample entry
     entry_idx = i + 1
     exit_idx_time = i + horizon
     if exit_idx_time >= n:
         return None, balance, i + 1, False
 
     entry_row = df.iloc[entry_idx]
-    entry_price = float(entry_row["open"])
+    entry_price_raw = float(entry_row["open"])
     entry_time = entry_row["time"]
+
+    # === APPLY SLIPPAGE DI ENTRY (market execution) ===
+    if direction == 1:
+        # BUY --> harga sedikit lebih buruk (lebih tinggi)
+        entry_price = entry_price_raw + AVG_SLIPPAGE_PIPS * PIP_SIZE
+    else:
+        # SELL --> harga sedikit lebih buruk (lebih rendah)
+        entry_price = entry_price_raw - AVG_SLIPPAGE_PIPS * PIP_SIZE
 
     atr_val = float(atr_val)
     sl_dist = ATR_MULT_SL * atr_val
-    rr_tp = get_rr_tp_for_row(row_decision, direction)
-    tp_dist = rr_tp * sl_dist
-
     if sl_dist <= 0:
         return None, balance, i + 1, False
+
+    # RR base dari ADX + MTF trend
+    rr_tp_base = get_rr_tp_for_row(row_decision, direction)
+    # Modif oleh Hybrid Strength
+    rr_tp = rr_tp_base * rr_mult
+    # Clamp RR biar nggak absurd
+    rr_tp = max(rr_tp, 1.0)
+    rr_tp = min(rr_tp, 4.0)
+
+    tp_dist = rr_tp * sl_dist
 
     # ==== Drawdown sekarang (sebelum trade) ====
     if peak_balance > 0:
@@ -228,10 +303,18 @@ def simulate_trade_path(
     else:
         dd_frac = 0.0
 
-    # ==== Risk% dinamis (ADX + drawdown) ====
-    risk_pct = get_risk_pct_for_row(row_decision, dd_frac)
+    # ==== Risk% dinamis (ADX + DD) lalu dikali Hybrid risk_mult ====
+    risk_core = get_risk_pct_core(row_decision, dd_frac)
+    risk_pct = risk_core * risk_mult
+    risk_pct = min(risk_pct, MAX_RISK_PCT)
+    risk_pct = max(risk_pct, 0.0)
+
+    if risk_pct <= 0:
+        return None, balance, i + 1, False
+
     risk_amount = balance * risk_pct
 
+    # Lot sizing (risk / SL)
     lot = risk_amount / (sl_dist * CONTRACT_SIZE)
     lot = max(lot, MIN_LOT)
     lot = min(lot, MAX_LOT)
@@ -243,6 +326,7 @@ def simulate_trade_path(
     if margin_required > balance:
         return None, balance, i + 1, False
 
+    # Level SL/TP
     if direction == 1:
         sl_level = entry_price - sl_dist
         tp_level = entry_price + tp_dist
@@ -256,11 +340,13 @@ def simulate_trade_path(
     margin_call = False
     exit_idx = entry_idx
 
+    # Simulasi bar-by-bar sampai horizon
     for j in range(entry_idx, exit_idx_time + 1):
         bar = df.iloc[j]
         high = float(bar["high"])
         low = float(bar["low"])
 
+        # Margin call simulasi (sama seperti DL/XGB backtest)
         if direction == 1:
             worst_price = low
         else:
@@ -277,6 +363,7 @@ def simulate_trade_path(
             exit_idx = j
             break
 
+        # Cek SL/TP
         if direction == 1:
             if low <= sl_level:
                 exit_price = sl_level
@@ -304,12 +391,23 @@ def simulate_trade_path(
                 exit_idx = j
                 break
 
+    # Kalau sampai horizon nggak kena SL/TP/MARGIN_CALL -> exit di close horizon
     if exit_price is None:
         exit_row = df.iloc[exit_idx_time]
         exit_price = float(exit_row["close"])
         exit_time = exit_row["time"]
         exit_reason = "TIME"
         exit_idx = exit_idx_time
+    
+    exit_price_raw = exit_price
+
+    if exit_reason in ("SL", "TP", "MARGIN_CALL"):
+        if direction == 1:
+            # long: exit slippage selalu bikin harga lebih jelek (lebih rendah)
+            exit_price = exit_price_raw - AVG_SLIPPAGE_PIPS * PIP_SIZE
+        else:
+            # short: exit slippage bikin harga lebih jelek (lebih tinggi)
+            exit_price = exit_price_raw + AVG_SLIPPAGE_PIPS * PIP_SIZE
 
     price_move = (exit_price - entry_price) * direction
     gross_pnl_usd = price_move * CONTRACT_SIZE * lot
@@ -351,6 +449,10 @@ def simulate_trade_path(
         "balance_before": balance_before,
         "balance_after": balance_after,
         "is_margin_call": margin_call,
+        "hybrid_conf_group": conf_group,
+        "risk_mult": risk_mult,
+        "rr_mult": rr_mult,
+        "rr_final": rr_tp,
     }
 
     return trade, balance_after, exit_idx + 1, margin_call
@@ -430,7 +532,7 @@ def calc_stats(
     avg_lot = trades_df["lot"].mean()
     max_lot = trades_df["lot"].max()
 
-    print("===== DL (LSTM) ATR SL/TP BACKTEST (SUPER REAL) =====")
+    print("===== HYBRID (LSTM + XGB) ATR SL/TP BACKTEST (SUPER REAL) =====")
     print(f"Trades             : {n_trades}")
     print(f"Winrate overall    : {winrate * 100:.2f}%")
     print(f"Avg R per trade    : {trades_df['ret_real'].mean() * 100:.3f}%")
@@ -456,9 +558,14 @@ def calc_stats(
         print("    Balance setelah MC :", last_mc["balance_after"])
     print("=====================================================")
 
+    # Optional: breakdown per hybrid confidence
+    if "hybrid_conf_group" in trades_df.columns:
+        print("\n===== HYBRID CONFIDENCE BREAKDOWN =====")
+        print(trades_df["hybrid_conf_group"].value_counts(normalize=True))
+
 
 def main():
-    parser = argparse.ArgumentParser(description="DL ATR backtest with lot & margin.")
+    parser = argparse.ArgumentParser(description="HYBRID ATR backtest with lot & margin.")
     parser.add_argument("--start", type=str, default=None, help="Start date (YYYY-MM-DD)")
     parser.add_argument("--end", type=str, default=None, help="End date (YYYY-MM-DD)")
     parser.add_argument("--balance", type=float, default=START_BALANCE, help="Starting balance")
@@ -467,11 +574,13 @@ def main():
     df = pd.read_csv(INPUT_FILE, parse_dates=["time"])
     df = df.sort_values("time").reset_index(drop=True)
 
+    # ADX kalau belum ada
     if ADX_COL not in df.columns:
         print(f"[INFO] Kolom ADX '{ADX_COL}' belum ada, menghitung dengan pandas_ta...")
         adx = ta.adx(df["high"], df["low"], df["close"], length=14)
         df = pd.concat([df, adx[["ADX_14"]]], axis=1)
 
+    # MTF trend H1
     if USE_MTF_FILTER:
         df_h1 = df.resample("1h", on="time").agg({"close": "last"}).dropna()
         df_h1["ema_fast"] = df_h1["close"].ewm(span=H1_EMA_FAST, adjust=False).mean()
@@ -518,8 +627,8 @@ def main():
     )
     print("[INFO] Generated trades:", len(trades_df))
 
-    trades_df.to_csv("dl_signal_trades_superreal_atr_sl_tp_cost.csv", index=False)
-    print("[OK] Saved trades -> dl_signal_trades_superreal_atr_sl_tp_cost.csv")
+    trades_df.to_csv("hybrid_signal_trades_superreal_atr_sl_tp_cost.csv", index=False)
+    print("[OK] Saved trades -> hybrid_signal_trades_superreal_atr_sl_tp_cost.csv")
 
     calc_stats(trades_df, start_balance=args.balance, margin_call_happened=margin_call_happened)
 

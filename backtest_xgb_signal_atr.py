@@ -4,7 +4,7 @@ import argparse
 import pandas_ta as ta
 
 # ================== CONFIG ==================
-INPUT_FILE = "XAUUSD_M15_WITH_DL_SIGNALS_FULL.csv"
+INPUT_FILE = "XAUUSD_M15_WITH_XGB_SIGNALS_FULL.csv"
 
 HORIZON = 3
 
@@ -185,8 +185,8 @@ def simulate_trade_path(
     if not passes_regime_filters(row_decision):
         return None, balance, i + 1, False
 
-    sig = int(row_decision.get("dl_signal", 0))
-    proba_up = row_decision.get("dl_proba_up", np.nan)
+    sig = int(row_decision.get("xgb_signal", 0))
+    proba_up = row_decision.get("xgb_proba_up", np.nan)
     atr_val = row_decision.get(ATR_COL, np.nan)
 
     if sig == 0 or np.isnan(proba_up) or np.isnan(atr_val) or i + 1 >= n:
@@ -518,8 +518,8 @@ def main():
     )
     print("[INFO] Generated trades:", len(trades_df))
 
-    trades_df.to_csv("dl_signal_trades_superreal_atr_sl_tp_cost.csv", index=False)
-    print("[OK] Saved trades -> dl_signal_trades_superreal_atr_sl_tp_cost.csv")
+    trades_df.to_csv("xgb_signal_trades_superreal_atr_sl_tp_cost.csv", index=False)
+    print("[OK] Saved trades -> xgb_signal_trades_superreal_atr_sl_tp_cost.csv")
 
     calc_stats(trades_df, start_balance=args.balance, margin_call_happened=margin_call_happened)
 

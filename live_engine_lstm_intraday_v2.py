@@ -1,27 +1,36 @@
-# live_engine_lstm_intraday_v2.py
+# live_engine_hybrid_intraday.py
 #
-# DL Intraday Live Engine (XAUUSD M15, LSTM + ATR SL/TP, Dynamic Lot + Regime Filters)
+# HYBRID Intraday Live Engine (LSTM + XGB, XAUUSD M15)
 #
 # - Connect MT5
 # - Ambil M15/H1/D1
-# - Bangun fitur (sama seperti training pipeline: features_intraday)
-# - Normalisasi pakai feat_mean/std dari NPZ (prepare_dl_dataset.py)
-# - LSTM inference -> proba_up, signal
+# - Bangun fitur (features_intraday: add_m15_features, add_h1_context, add_daily_context)
+# - LSTM inference  -> dl_proba_up
+# - XGB inference   -> xgb_proba_up
+# - Hybrid combine  -> hybrid_proba_up, hybrid_signal, hybrid_conf_group
 # - Apply:
-#     * Proba confidence filter
+#     * Proba confidence filter (hybrid)
 #     * Regime filter (ATR MA + ADX + Session)
 #     * MTF trend filter (H1 EMA 50/200)
-#     * Dynamic TP (RR based on ADX + MTF trend)
-#     * Dynamic risk (ADX + drawdown throttle)
-# - Live:
-#     - DRY_RUN=False  -> kirim order real ke MT5
-#     - DRY_RUN=True   -> hanya buka posisi virtual & simulasi SL/TP + equity curve
+#     * Dynamic TP (RR based on ADX + MTF trend + hybrid strength)
+#     * Dynamic risk (ADX + drawdown throttle + hybrid strength)
+# - Hitung lot dinamis & kirim order (kalau DRY_RUN=False)
 #
 # NOTE:
-#   - Pastikan features_intraday.py ada di folder yang sama:
+#   - Butuh:
 #       from features_intraday import add_m15_features, add_h1_context, add_daily_context
-#   - Pastikan NPZ (DATA_META_FILE) sama dengan yang dipakai training/backtest:
-#       mengandung: feature_names, feat_mean, feat_std, seq_len
+#   - Butuh NPZ LSTM:
+#       dl_intraday_dataset_seq*.npz  (feature_names, feat_mean, feat_std, seq_len)
+#   - Butuh NPZ XGB:
+#       xgb_intraday_meta.npz         (xgb_feature_names)
+#   - Config utama di dl_live_config.ini
+#
+#   ❗ Hybrid weighting & confidence threshold HARUS disamain dengan versi backtest hybrid lu
+#   kalau mau hasilnya mirip. Di sini gue set default:
+#       HYB_LSTM_WEIGHT = 0.6
+#       HYB_XGB_WEIGHT  = 0.4
+#       HYB_CONF_STRONG   = 0.30
+#       HYB_CONF_MODERATE = 0.20
 
 import time
 from datetime import datetime
@@ -33,6 +42,7 @@ import pandas_ta as ta
 import MetaTrader5 as mt5
 import torch
 import torch.nn as nn
+import xgboost as xgb
 
 from features_intraday import add_m15_features, add_h1_context, add_daily_context
 
@@ -41,31 +51,45 @@ from features_intraday import add_m15_features, add_h1_context, add_daily_contex
 
 def load_config():
     cfg = configparser.ConfigParser()
-    cfg.read("dl_live_config.ini")  # pastikan filenya ada di folder yang sama
+    cfg.read("dl_live_config.ini")
     return cfg
 
 
 cfg = load_config()
 
-SYMBOL = cfg["MT5"].get("SYMBOL", "XAUUSD")
+# --- MT5 / umum ---
+SYMBOL       = cfg["MT5"].get("SYMBOL", "XAUUSD")
 MAGIC_NUMBER = cfg["MT5"].getint("MAGIC_NUMBER", 987654)
-DRY_RUN = cfg["MT5"].getboolean("DRY_RUN", True)
+DRY_RUN      = cfg["MT5"].getboolean("DRY_RUN", True)
 
-MODEL_PATH = cfg["MODEL"].get("MODEL_PATH")
-DATA_META_FILE = cfg["MODEL"].get("DATA_META_FILE")
-THR_LONG = cfg["MODEL"].getfloat("THR_LONG")
-THR_SHORT = cfg["MODEL"].getfloat("THR_SHORT")
+# --- LSTM model (pakai section [MODEL], sama seperti engine sebelumnya) ---
+MODEL_PATH_LSTM   = cfg["MODEL"].get("MODEL_PATH", "lstm_intraday_best.pt")
+DATA_META_FILE_DL = cfg["MODEL"].get("DATA_META_FILE", "dl_intraday_dataset_seq64.npz")
+THR_LONG_DL       = cfg["MODEL"].getfloat("THR_LONG", 0.70)
+THR_SHORT_DL      = cfg["MODEL"].getfloat("THR_SHORT", 0.30)
 
-ATR_COL = cfg["ATR_SLTP"].get("ATR_COL", "atr_14_m15")
-ATR_MULT_SL = cfg["ATR_SLTP"].getfloat("ATR_MULT_SL", 1.2)
-RR_TP = cfg["ATR_SLTP"].getfloat("RR_TP", 2.0)  # fallback kalau dynamic TP dimatikan
+# --- XGB model (section optional [MODEL_XGB]) ---
+try:
+    MODEL_PATH_XGB = cfg["MODEL_XGB"].get("MODEL_PATH", "xgb_intraday.model")
+    META_FILE_XGB  = cfg["MODEL_XGB"].get("META_FILE", "xgb_intraday_meta.npz")
+except KeyError:
+    # fallback kalau section belum ada
+    MODEL_PATH_XGB = "xgb_intraday.model"
+    META_FILE_XGB  = "xgb_intraday_meta.npz"
 
-RISK_PER_TRADE = cfg["LOTS"].getfloat("RISK_PER_TRADE", 0.01)  # fallback
-MIN_LOT = cfg["LOTS"].getfloat("MIN_LOT", 0.01)
-MAX_LOT = cfg["LOTS"].getfloat("MAX_LOT", 0.10)
+# --- ATR / TP-SL (fallback sama seperti backtest) ---
+ATR_COL      = cfg["ATR_SLTP"].get("ATR_COL", "atr_14_m15")
+ATR_MULT_SL  = cfg["ATR_SLTP"].getfloat("ATR_MULT_SL", 1.2)
+RR_TP_GLOBAL = cfg["ATR_SLTP"].getfloat("RR_TP", 2.0)  # kalau dynamic TP OFF
 
-COMMISSION_PER_001 = cfg["COST_SIMULATION"].getfloat("COMMISSION_PER_001", 0.06)
-SPREAD_HIDDEN_USD = cfg["COST_SIMULATION"].getfloat("SPREAD_HIDDEN_USD", 0.037)
+# --- LOT dari config (fallback kalau dynamic risk OFF) ---
+RISK_PER_TRADE = cfg["LOTS"].getfloat("RISK_PER_TRADE", 0.01)
+MIN_LOT        = cfg["LOTS"].getfloat("MIN_LOT", 0.01)
+MAX_LOT        = cfg["LOTS"].getfloat("MAX_LOT", 0.10)
+
+# --- Biaya trading (buat estimasi / logging) ---
+COMMISSION_PER_001     = cfg["COST_SIMULATION"].getfloat("COMMISSION_PER_001", 0.06)
+SPREAD_HIDDEN_USD      = cfg["COST_SIMULATION"].getfloat("SPREAD_HIDDEN_USD", 0.037)
 EST_COST_PER_TRADE_001 = COMMISSION_PER_001 + SPREAD_HIDDEN_USD
 
 TIMEFRAME_MAP = {
@@ -82,44 +106,50 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Akan diisi setelah connect_mt5
 CONTRACT_SIZE = 100.0
-SYMBOL_INFO = None
+SYMBOL_INFO   = None
 
-# ==== SIMULATION STATE (untuk DRY_RUN) ====
-SIM_START_BALANCE = 100.0
-sim_balance = SIM_START_BALANCE
-sim_peak_balance = SIM_START_BALANCE
-sim_position = None       # dict posisi virtual open
-sim_trades: list[dict] = []
+# Simulasi DD throttle pakai equity akun
+HORIZON = 3  # sama dengan labeling / backtest
 
-# ========= CONFIG LIVE ENGINE (SAMA DENGAN BACKTEST) =========
+# ===== HYBRID CONFIG (samakan dengan backtest hybrid lu) =====
 
-HORIZON = 3  # sama seperti labeling
+# hybrid probability:
+#   hybrid_proba_up = W_LSTM * dl_proba_up + W_XGB * xgb_proba_up
+HYB_LSTM_WEIGHT = 0.6
+HYB_XGB_WEIGHT  = 0.4
 
-# Proba confidence filter
-USE_PROBA_CONF_FILTER = True
-PROBA_CONF_MARGIN = 0.25
+# hybrid confidence:
+#   conf = |hybrid_proba_up - 0.5|
+HYB_CONF_STRONG   = 0.30   # >= 0.30  -> A_STRONG
+HYB_CONF_MODERATE = 0.20   # >= 0.20  -> B_MODERATE
+# di bawah itu -> WEAK (no trade)
 
-# Dynamic TP (RR tergantung ADX + MTF trend)
-USE_DYNAMIC_TP = True
-RR_TP_BASE = 2.0
-ADX_TP_MED = 20.0
-ADX_TP_STRONG = 25.0
-RR_TP_MED_TREND = 2.5
+# Dynamic TP (RR tergantung ADX + MTF trend + hybrid strength)
+USE_DYNAMIC_TP   = True
+RR_TP_BASE       = 2.0        # baseline
+ADX_TP_MED       = 20.0
+ADX_TP_STRONG    = 25.0
+RR_TP_MED_TREND  = 2.5
 RR_TP_STRONG_TREND = 3.0
+# extra boost by hybrid strength:
+RR_BOOST_STRONG   = 0.5      # tambahan R untuk A_STRONG
+RR_BOOST_MODERATE = 0.0
 
-# Dynamic risk (persentase risk per trade adaptif terhadap ADX + drawdown)
+# Dynamic risk (persentase risk per trade adaptif terhadap ADX + drawdown + hybrid strength)
 USE_DYNAMIC_RISK = True
-BASE_RISK_PCT = 0.0200  # 2.0% base
-MIN_RISK_PCT = 0.10     # 10%
-MAX_RISK_PCT = 0.15     # 15%
+BASE_RISK_PCT    = 0.0200  # 2.0% base
+MIN_RISK_PCT     = 0.10    # 10%  (sesuai backtest agresif)
+MAX_RISK_PCT     = 0.15    # 15%
+RISK_MULT_STRONG   = 1.5   # A_STRONG
+RISK_MULT_MODERATE = 1.0   # B_MODERATE
 
-# Market model XAUUSD (dipakai hanya buat lot sizing)
-LEVERAGE = 500  # nggak terlalu dipakai di live (margin call real dari broker)
+# Market model XAUUSD (hanya buat size lot & margin logika internal, real margin by broker)
+LEVERAGE = 500
 
 # Regime filters
 USE_REGIME_FILTERS = True
 ATR_MA_PERIOD = 50
-ATR_MIN_MULT = 1.0
+ATR_MIN_MULT  = 1.0
 
 ADX_COL = "ADX_14"
 ADX_MIN = 15.0
@@ -127,16 +157,18 @@ ADX_MIN = 15.0
 # Session filter
 USE_SESSION_FILTER = True
 SESSION_START_HOUR = 7
-SESSION_END_HOUR = 22
+SESSION_END_HOUR   = 22
 
 # MTF trend filter
 USE_MTF_FILTER = True
 MTF_TREND_COL = "trend_h1_dir"
-H1_EMA_FAST = 50
-H1_EMA_SLOW = 200
+H1_EMA_FAST   = 50
+H1_EMA_SLOW   = 200
 
+# Proba filter di level HYBRID (bukan per model)
+USE_HYB_CONF_FILTER = True
 
-# =============== MODEL DEF ==================
+# ====== MODEL DEF ======
 
 class LSTMClassifier(nn.Module):
     def __init__(self, input_dim, hidden_dim=64, num_layers=2, dropout=0.2):
@@ -162,35 +194,39 @@ class LSTMClassifier(nn.Module):
         return logits
 
 
-def load_meta_and_model():
-    """
-    Load:
-      - feature_names
-      - seq_len
-      - feat_mean, feat_std (untuk normalisasi sama seperti training)
-      - LSTM model
-    """
-    data = np.load(DATA_META_FILE, allow_pickle=True)
+def load_lstm_meta_and_model():
+    data = np.load(DATA_META_FILE_DL, allow_pickle=True)
     feature_names = list(data["feature_names"])
-    seq_len = int(data["seq_len"][0])
-
-    feat_mean = data["feat_mean"].astype(np.float32)
-    feat_std = data["feat_std"].astype(np.float32)
+    seq_len       = int(data["seq_len"][0])
+    feat_mean     = data["feat_mean"].astype(np.float32)
+    feat_std      = data["feat_std"].astype(np.float32)
 
     input_dim = len(feature_names)
-
     model = LSTMClassifier(input_dim=input_dim)
-    state = torch.load(MODEL_PATH, map_location=DEVICE)
+    state = torch.load(MODEL_PATH_LSTM, map_location=DEVICE)
     model.load_state_dict(state)
     model.to(DEVICE)
     model.eval()
 
-    print("[INFO] Loaded meta/model:")
-    print("  seq_len      :", seq_len)
-    print("  n_features   :", input_dim)
-    print("  device       :", DEVICE)
+    print("[INFO] Loaded LSTM meta/model:")
+    print("  seq_len    :", seq_len)
+    print("  n_features :", input_dim)
+    print("  device     :", DEVICE)
 
     return feature_names, seq_len, feat_mean, feat_std, model
+
+
+def load_xgb_model_and_meta():
+    bst = xgb.Booster()
+    bst.load_model(MODEL_PATH_XGB)
+
+    meta = np.load(META_FILE_XGB, allow_pickle=True)
+    xgb_feature_names = list(meta["feature_names"])
+
+    print("[INFO] Loaded XGB model/meta:")
+    print("  features   :", len(xgb_feature_names))
+
+    return bst, xgb_feature_names
 
 
 # =============== MT5 UTILS ==================
@@ -231,9 +267,7 @@ def get_latest_m15_df(n_bars=500):
         raise RuntimeError(f"copy_rates_from_pos M15 failed: {mt5.last_error()}")
     df = pd.DataFrame(rates)
     df["time"] = pd.to_datetime(df["time"], unit="s")
-    df = df[
-        ["time", "open", "high", "low", "close", "tick_volume", "spread", "real_volume"]
-    ]
+    df = df[["time", "open", "high", "low", "close", "tick_volume", "spread", "real_volume"]]
     df = df.sort_values("time").reset_index(drop=True)
     return df
 
@@ -244,9 +278,7 @@ def get_latest_h1_df(n_bars=300):
         raise RuntimeError(f"copy_rates_from_pos H1 failed: {mt5.last_error()}")
     df = pd.DataFrame(rates)
     df["time"] = pd.to_datetime(df["time"], unit="s")
-    df = df[
-        ["time", "open", "high", "low", "close", "tick_volume", "spread", "real_volume"]
-    ]
+    df = df[["time", "open", "high", "low", "close", "tick_volume", "spread", "real_volume"]]
     df = df.sort_values("time").reset_index(drop=True)
     return df
 
@@ -257,9 +289,7 @@ def get_latest_d1_df(n_bars=200):
         raise RuntimeError(f"copy_rates_from_pos D1 failed: {mt5.last_error()}")
     df = pd.DataFrame(rates)
     df["time"] = pd.to_datetime(df["time"], unit="s")
-    df = df[
-        ["time", "open", "high", "low", "close", "tick_volume", "spread", "real_volume"]
-    ]
+    df = df[["time", "open", "high", "low", "close", "tick_volume", "spread", "real_volume"]]
     df = df.sort_values("time").reset_index(drop=True)
     return df
 
@@ -338,9 +368,24 @@ def passes_regime_filters(row: pd.Series) -> bool:
     return True
 
 
+def classify_hybrid_conf(hybrid_proba_up: float):
+    """
+    Balikkan (conf, group):
+      - group: "A_STRONG" / "B_MODERATE" / "WEAK"
+    """
+    conf = abs(hybrid_proba_up - 0.5)
+    if conf >= HYB_CONF_STRONG:
+        group = "A_STRONG"
+    elif conf >= HYB_CONF_MODERATE:
+        group = "B_MODERATE"
+    else:
+        group = "WEAK"
+    return conf, group
+
+
 def get_rr_tp_for_row(row: pd.Series, direction: int) -> float:
     if not USE_DYNAMIC_TP:
-        return RR_TP
+        return RR_TP_GLOBAL
 
     rr = RR_TP_BASE
     adx_val = row.get(ADX_COL, np.nan)
@@ -361,9 +406,10 @@ def get_rr_tp_for_row(row: pd.Series, direction: int) -> float:
     return rr
 
 
-def get_risk_pct_for_row(row: pd.Series, dd_frac: float | None) -> float:
+def get_risk_pct_for_row(row: pd.Series, dd_frac: float | None, conf_group: str) -> float:
     """
-    Risk% final = risk_core(ADX) * dd_factor(drawdown), lalu di-clamp MIN/MAX.
+    Risk% final = risk_core(ADX) * dd_factor(drawdown) * risk_mult(hybrid),
+    lalu di-clamp MIN/MAX.
     dd_frac: (equity - peak_equity) / peak_equity  (<= 0 saat DD)
     """
     if not USE_DYNAMIC_RISK:
@@ -385,9 +431,11 @@ def get_risk_pct_for_row(row: pd.Series, dd_frac: float | None) -> float:
             mult = 1.2
             risk_core = BASE_RISK_PCT * mult
 
+    # Clamp awal ke MIN/MAX
     risk_core = max(risk_core, MIN_RISK_PCT)
     risk_core = min(risk_core, MAX_RISK_PCT)
 
+    # Drawdown-based throttle
     if dd_frac is None:
         dd_factor = 1.0
     else:
@@ -402,28 +450,37 @@ def get_risk_pct_for_row(row: pd.Series, dd_frac: float | None) -> float:
         else:                       # >25%
             dd_factor = 0.0
 
-    risk = risk_core * dd_factor
+    # Hybrid confidence multiplier
+    if conf_group == "A_STRONG":
+        risk_mult = RISK_MULT_STRONG
+    elif conf_group == "B_MODERATE":
+        risk_mult = RISK_MULT_MODERATE
+    else:
+        risk_mult = 0.0  # WEAK → jangan trade
+
+    risk = risk_core * dd_factor * risk_mult
     risk = max(risk, 0.0)
     risk = min(risk, MAX_RISK_PCT)
     return risk
 
 
-def calculate_dynamic_lot(sl_dist: float, last_row: pd.Series, dd_frac: float) -> float:
+def calculate_dynamic_lot(sl_dist: float, last_row: pd.Series, dd_frac: float, conf_group: str) -> float:
     """
     Hitung lot berdasarkan:
-      - Dynamic risk (ADX + drawdown)
-      - Equity akun REAL
+      - Dynamic risk (ADX + drawdown + hybrid strength)
+      - Equity akun
       - SL distance (sl_dist) dalam harga
       - CONTRACT_SIZE
-    Dipakai hanya ketika kirim order beneran (DRY_RUN=False).
     """
     if sl_dist <= 0:
         return 0.0
 
     equity = get_account_equity()
-    risk_pct = get_risk_pct_for_row(last_row, dd_frac)
-    risk_amount = equity * risk_pct
+    risk_pct = get_risk_pct_for_row(last_row, dd_frac, conf_group)
+    if risk_pct <= 0:
+        return 0.0
 
+    risk_amount = equity * risk_pct
     raw_lot = risk_amount / (sl_dist * CONTRACT_SIZE)
     lot = clamp_lot_to_symbol(raw_lot)
     return lot
@@ -447,7 +504,7 @@ def send_order(direction: str, volume: float, entry_price: float, sl_price: floa
         "tp": tp_price,
         "deviation": 50,
         "magic": MAGIC_NUMBER,
-        "comment": "DL_INTRADAY_V2",
+        "comment": "HYBRID_INTRADAY_V1",
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
 
@@ -460,134 +517,6 @@ def send_order(direction: str, volume: float, entry_price: float, sl_price: floa
     print("[ORDER]", result)
     if result.retcode != mt5.TRADE_RETCODE_DONE:
         print("[WARN] Order failed:", result.retcode)
-
-
-# =========== SIMULATION HELPERS (DRY_RUN) ==========
-
-def open_sim_position(direction_str: str, entry_price: float,
-                      sl_price: float, tp_price: float,
-                      sl_dist: float, last_row: pd.Series):
-    """
-    Buka posisi virtual (hanya dipakai ketika DRY_RUN=True).
-    Risk & lot pakai dynamic risk yang sama dengan backtest,
-    tapi basis-nya sim_balance + sim_peak_balance.
-    """
-    global sim_position, sim_balance, sim_peak_balance
-
-    if sim_position is not None:
-        print("[SIM] Sudah ada posisi virtual open, skip open baru.")
-        return
-
-    if sl_dist <= 0:
-        print("[SIM] SL distance <= 0, skip sim trade.")
-        return
-
-    # Drawdown simulasi
-    if sim_peak_balance > 0:
-        dd_frac_sim = (sim_balance - sim_peak_balance) / sim_peak_balance
-    else:
-        dd_frac_sim = 0.0
-
-    # Risk% dinamis (pakai ADX + DD sim)
-    risk_pct = get_risk_pct_for_row(last_row, dd_frac_sim)
-    risk_amount = sim_balance * risk_pct
-
-    raw_lot = risk_amount / (sl_dist * CONTRACT_SIZE)
-    lot = clamp_lot_to_symbol(raw_lot)
-
-    if lot <= 0:
-        print("[SIM] Lot <= 0, skip sim trade.")
-        return
-
-    sim_position = {
-        "direction": direction_str,   # "LONG" / "SHORT"
-        "entry_price": entry_price,
-        "sl_price": sl_price,
-        "tp_price": tp_price,
-        "lot": lot,
-        "open_time": datetime.utcnow(),  # bisa diganti last_row["time"] kalau mau candle time
-        "balance_before": sim_balance,
-    }
-
-    print(f"[SIM] Open {direction_str} {lot:.3f} @ {entry_price:.2f} SL={sl_price:.2f} TP={tp_price:.2f}")
-
-
-def update_sim_position_with_bar(last_bar: pd.Series):
-    """
-    Dipanggil setiap M15 bar close (hanya kalau DRY_RUN=True).
-    Cek apakah bar ini menyentuh SL/TP posisi virtual.
-    """
-    global sim_position, sim_balance, sim_peak_balance, sim_trades
-
-    if sim_position is None:
-        return
-
-    high = float(last_bar["high"])
-    low = float(last_bar["low"])
-    time_bar = last_bar["time"]
-
-    direction = sim_position["direction"]
-    entry = sim_position["entry_price"]
-    sl = sim_position["sl_price"]
-    tp = sim_position["tp_price"]
-    lot = sim_position["lot"]
-
-    exit_price = None
-    exit_reason = None
-
-    if direction == "LONG":
-        if low <= sl:
-            exit_price = sl
-            exit_reason = "SL"
-        elif high >= tp:
-            exit_price = tp
-            exit_reason = "TP"
-    else:  # SHORT
-        if high >= sl:
-            exit_price = sl
-            exit_reason = "SL"
-        elif low <= tp:
-            exit_price = tp
-            exit_reason = "TP"
-
-    # kalau nggak kena SL/TP di bar ini -> posisi lanjut
-    if exit_price is None:
-        return
-
-    # hitung PnL
-    direction_sign = 1 if direction == "LONG" else -1
-    price_move = (exit_price - entry) * direction_sign
-    gross_pnl = price_move * CONTRACT_SIZE * lot
-
-    cost_per_001 = EST_COST_PER_TRADE_001
-    total_cost = cost_per_001 * (lot / 0.01)
-
-    net_pnl = gross_pnl - total_cost
-
-    balance_before = sim_balance
-    sim_balance = max(0.0, sim_balance + net_pnl)
-    sim_peak_balance = max(sim_peak_balance, sim_balance)
-
-    trade = {
-        "direction": direction,
-        "entry_price": entry,
-        "exit_price": exit_price,
-        "sl_price": sl,
-        "tp_price": tp,
-        "lot": lot,
-        "open_time": sim_position["open_time"],
-        "close_time": time_bar,
-        "gross_pnl": gross_pnl,
-        "cost": total_cost,
-        "net_pnl": net_pnl,
-        "balance_before": balance_before,
-        "balance_after": sim_balance,
-        "exit_reason": exit_reason,
-    }
-    sim_trades.append(trade)
-
-    print(f"[SIM] Close {direction} @ {exit_price:.2f} ({exit_reason}), PnL={net_pnl:.2f}, Bal={sim_balance:.2f}")
-    sim_position = None
 
 
 # =========== FEATURE BUILDER LIVE ==========
@@ -623,7 +552,7 @@ def build_features_for_m15(df_m15_raw: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"{ATR_COL} tidak ada di live features")
     df_feat["atr_ma_50"] = df_feat[ATR_COL].rolling(ATR_MA_PERIOD).mean()
 
-    # MTF trend H1 (EMA fast/slow di-resample dari M15)
+    # MTF trend H1 (EMA fast/slow dari resample M15)
     if USE_MTF_FILTER:
         df_tmp = df_feat.set_index("time")
         df_h1_trend = df_tmp["close"].resample("1h").last().dropna().to_frame("close")
@@ -649,7 +578,7 @@ def build_features_for_m15(df_m15_raw: pd.DataFrame) -> pd.DataFrame:
 
 # =============== INFERENCE =================
 
-def build_sequence_from_df(
+def build_lstm_sequence(
     df_feat: pd.DataFrame,
     feature_names: list[str],
     seq_len: int,
@@ -662,42 +591,67 @@ def build_sequence_from_df(
     df_seq = df_feat.sort_values("time").iloc[-seq_len:]
     missing = [f for f in feature_names if f not in df_seq.columns]
     if missing:
-        raise ValueError(f"Missing feature columns in live DF: {missing}")
+        raise ValueError(f"Missing LSTM feature columns in live DF: {missing}")
 
     X_raw = df_seq[feature_names].to_numpy(dtype=np.float32)
     X_norm = (X_raw - feat_mean) / feat_std
-
     X = np.expand_dims(X_norm, axis=0)
+
     last_row = df_seq.iloc[-1]
     return X, last_row
 
 
-def infer_signal(model, X, last_row: pd.Series, bid: float, ask: float):
+def infer_lstm_proba(model, X) -> float:
     X_t = torch.from_numpy(X).float().to(DEVICE)
     with torch.no_grad():
         logits = model(X_t)
         prob = torch.softmax(logits, dim=1)
         proba_up = float(prob[0, 1].cpu().item())
+    return proba_up
 
-    if proba_up >= THR_LONG:
+
+def infer_xgb_proba(bst: xgb.Booster, last_row: pd.Series, xgb_feature_names: list[str]) -> float:
+    missing = [f for f in xgb_feature_names if f not in last_row.index]
+    if missing:
+        raise ValueError(f"Missing XGB feature columns in live DF: {missing}")
+
+    x_vec = last_row[xgb_feature_names].to_numpy(dtype=np.float32).reshape(1, -1)
+    dmatrix = xgb.DMatrix(x_vec, feature_names=xgb_feature_names)
+    proba = float(bst.predict(dmatrix)[0])  # proba kelas 1 (UP)
+    return proba
+
+
+def build_hybrid_signal(dl_proba_up: float, xgb_proba_up: float, bid: float, ask: float, last_row: pd.Series):
+    # Weighted hybrid proba
+    hybrid_proba_up = HYB_LSTM_WEIGHT * dl_proba_up + HYB_XGB_WEIGHT * xgb_proba_up
+    conf, conf_group = classify_hybrid_conf(hybrid_proba_up)
+
+    # Tentukan arah dari hybrid_proba_up
+    if hybrid_proba_up > 0.5:
         raw_signal = 1
-    elif proba_up <= THR_SHORT:
+    elif hybrid_proba_up < 0.5:
         raw_signal = -1
     else:
         raw_signal = 0
 
-    # Confidence filter
-    if USE_PROBA_CONF_FILTER:
-        conf = abs(proba_up - 0.5)
-        if conf < PROBA_CONF_MARGIN:
-            raw_signal = 0
-
-    # Regime filter (ATR/ADX/Session)
-    if not passes_regime_filters(last_row):
+    # Hybrid confidence filter
+    if USE_HYB_CONF_FILTER and conf_group == "WEAK":
         filtered_signal = 0
     else:
         filtered_signal = raw_signal
 
+    # Regime filter terakhir
+    if not passes_regime_filters(last_row):
+        filtered_signal = 0
+
+    # MTF trend filter
+    if filtered_signal != 0 and USE_MTF_FILTER:
+        trend_dir = last_row.get(MTF_TREND_COL, 0)
+        if not (pd.isna(trend_dir) or trend_dir == 0):
+            if int(trend_dir) != filtered_signal:
+                filtered_signal = 0
+
+    # Siapkan info entry
     if filtered_signal == 1:
         direction_str = "LONG"
         entry_price = float(ask)
@@ -733,8 +687,11 @@ def infer_signal(model, X, last_row: pd.Series, bid: float, ask: float):
             tp_price = entry_price - tp_dist
 
     return {
-        "proba_up": proba_up,
-        "raw_signal": raw_signal,
+        "dl_proba_up": dl_proba_up,
+        "xgb_proba_up": xgb_proba_up,
+        "hybrid_proba_up": hybrid_proba_up,
+        "hybrid_conf": conf,
+        "hybrid_conf_group": conf_group,
         "signal": filtered_signal,
         "direction": direction_str,
         "entry_price": entry_price,
@@ -750,22 +707,23 @@ def infer_signal(model, X, last_row: pd.Series, bid: float, ask: float):
 # =============== MAIN LOOP =================
 
 def main_loop():
-    global sim_balance, sim_peak_balance
+    # Load model & meta
+    dl_feature_names, seq_len, feat_mean, feat_std, lstm_model = load_lstm_meta_and_model()
+    xgb_model, xgb_feature_names = load_xgb_model_and_meta()
 
-    feature_names, seq_len, feat_mean, feat_std, model = load_meta_and_model()
     connect_mt5()
 
-    print("[INFO] Starting main loop...")
+    print("[INFO] Starting HYBRID main loop...")
     print(f"[INFO] Dynamic risk: BASE={BASE_RISK_PCT*100:.2f}% MIN={MIN_RISK_PCT*100:.2f}% MAX={MAX_RISK_PCT*100:.2f}%")
+    print(f"[INFO] Hybrid weights: LSTM={HYB_LSTM_WEIGHT:.2f}, XGB={HYB_XGB_WEIGHT:.2f}")
+    print(f"[INFO] Hybrid conf: STRONG>={HYB_CONF_STRONG}, MOD>={HYB_CONF_MODERATE}")
     print(f"[INFO] Lot bounds: MIN_LOT={MIN_LOT}, MAX_LOT={MAX_LOT}")
-    print(f"[SIM]  Starting sim balance: {SIM_START_BALANCE}")
-    print(f"[INFO] Dynamic TP: BASE={RR_TP_BASE}, MED={RR_TP_MED_TREND}, STRONG={RR_TP_STRONG_TREND}")
+    print(f"[INFO] Dynamic TP: BASE={RR_TP_BASE}, MED={RR_TP_MED_TREND}, STRONG={RR_TP_STRONG_TREND}, BOOST_STRONG={RR_BOOST_STRONG}")
     print(f"[INFO] Regime: ATR_MA_PERIOD={ATR_MA_PERIOD}, ADX_MIN={ADX_MIN}, Session={SESSION_START_HOUR}-{SESSION_END_HOUR}")
-    print(f"[INFO] DRY_RUN = {DRY_RUN}")
 
     last_bar_time = None
 
-    # Track peak equity REAL untuk drawdown-based throttle (kalau pakai real account)
+    # Track peak equity untuk DD throttle
     equity_now = get_account_equity()
     peak_equity = equity_now
 
@@ -773,7 +731,6 @@ def main_loop():
         try:
             df_m15 = get_latest_m15_df(n_bars=500)
             current_bar_time = df_m15["time"].iloc[-1]
-            last_bar = df_m15.iloc[-1]
 
             # Deteksi bar baru (close M15)
             if last_bar_time is not None and current_bar_time == last_bar_time:
@@ -783,17 +740,12 @@ def main_loop():
             last_bar_time = current_bar_time
             print(f"\n[INFO] New M15 bar detected: {current_bar_time}")
 
-            # Update equity & peak equity untuk DD throttle (REAL account)
+            # Update equity & peak equity
             equity_now = get_account_equity()
             peak_equity = max(peak_equity, equity_now)
             dd_frac = (equity_now - peak_equity) / peak_equity if peak_equity > 0 else 0.0
 
-            print(f"  Equity(real): {equity_now:.2f}, Peak(real): {peak_equity:.2f}, DD(real): {dd_frac*100:.2f}%")
-
-            # Update posisi SIMULASI (kalau DRY_RUN)
-            if DRY_RUN:
-                update_sim_position_with_bar(last_bar)
-                print(f"  [SIM] Bal={sim_balance:.2f}, Peak={sim_peak_balance:.2f}")
+            print(f"  Equity: {equity_now:.2f}, Peak: {peak_equity:.2f}, DD: {dd_frac*100:.2f}%")
 
             df_feat = build_features_for_m15(df_m15)
             if len(df_feat) < seq_len:
@@ -801,62 +753,74 @@ def main_loop():
                 time.sleep(5)
                 continue
 
-            X, last_row = build_sequence_from_df(
-                df_feat, feature_names, seq_len, feat_mean, feat_std
+            # Build seq untuk LSTM
+            X_lstm, last_row = build_lstm_sequence(
+                df_feat, dl_feature_names, seq_len, feat_mean, feat_std
             )
             bid, ask = get_symbol_tick()
 
-            result = infer_signal(model, X, last_row, bid, ask)
+            # LSTM proba
+            dl_proba_up = infer_lstm_proba(lstm_model, X_lstm)
 
-            print("  Decision time:", result["decision_time"])
-            print(f"  proba_up      : {result['proba_up']:.4f}")
-            print(f"  raw_signal    : {result['raw_signal']}")
-            print(f"  filtered sig  : {result['signal']} ({result['direction']})")
+            # XGB proba (pakai last_row)
+            xgb_proba_up = infer_xgb_proba(xgb_model, last_row, xgb_feature_names)
+
+            # Hybrid combine
+            result = build_hybrid_signal(dl_proba_up, xgb_proba_up, bid, ask, last_row)
+
+            print("  Decision time     :", result["decision_time"])
+            print(f"  dl_proba_up       : {result['dl_proba_up']:.4f}")
+            print(f"  xgb_proba_up      : {result['xgb_proba_up']:.4f}")
+            print(f"  hybrid_proba_up   : {result['hybrid_proba_up']:.4f}")
+            print(f"  hybrid_conf       : {result['hybrid_conf']:.4f}")
+            print(f"  hybrid_conf_group : {result['hybrid_conf_group']}")
+            print(f"  hybrid_signal     : {result['signal']} ({result['direction']})")
 
             if result["signal"] == 0:
                 print("  -> FLAT / filtered out, no trade.")
             else:
-                print(f"  entry_price   : {result['entry_price']:.2f}")
-                print(f"  ATR(M15)      : {result['atr_m15']:.2f}")
-                print(f"  SL price      : {result['sl_price']:.2f}")
-                print(f"  TP price      : {result['tp_price']:.2f}")
-                print(f"  RR (approx)   : {result['tp_dist'] / result['sl_dist']:.2f} R")
+                print(f"  entry_price       : {result['entry_price']:.2f}")
+                print(f"  ATR(M15)          : {result['atr_m15']:.2f}")
+                print(f"  SL price          : {result['sl_price']:.2f}")
+                print(f"  TP price          : {result['tp_price']:.2f}")
+                rr_approx = result["tp_dist"] / result["sl_dist"] if result["sl_dist"] else 0.0
+                print(f"  RR (approx)       : {rr_approx:.2f} R")
 
                 if result["sl_dist"] is None or result["sl_dist"] <= 0:
                     print("  -> SL distance invalid, skip trade.")
                     time.sleep(5)
                     continue
 
-                # Lot REAL (kalau suatu saat DRY_RUN=False)
-                lot_real = calculate_dynamic_lot(result["sl_dist"], last_row, dd_frac)
-                print(f"  [REAL] Dynamic lot suggestion : {lot_real:.3f}")
+                lot = calculate_dynamic_lot(
+                    result["sl_dist"],
+                    last_row,
+                    dd_frac,
+                    result["hybrid_conf_group"],
+                )
+                if lot <= 0:
+                    print("  -> Calculated lot <= 0, skip trade.")
+                    time.sleep(5)
+                    continue
 
-                est_cost_real = EST_COST_PER_TRADE_001 * (lot_real / 0.01)
-                print(f"  [REAL] Est. cost/trade (lot {lot_real:.3f}) ~ {est_cost_real:.3f} USD")
+                est_cost = EST_COST_PER_TRADE_001 * (lot / 0.01)
+                print(f"  Dynamic lot       : {lot:.3f}")
+                print(f"  Est. cost/trade   : ~{est_cost:.3f} USD")
 
-                if DRY_RUN:
-                    # Paper trading mode: buka posisi virtual
-                    open_sim_position(
+                if has_open_position():
+                    print("  -> Existing position detected, skip new order.")
+                else:
+                    print(
+                        "  -> DRY_RUN: would send HYBRID order now."
+                        if DRY_RUN
+                        else "  -> Sending HYBRID order..."
+                    )
+                    send_order(
                         result["direction"],
+                        lot,
                         result["entry_price"],
                         result["sl_price"],
                         result["tp_price"],
-                        result["sl_dist"],
-                        last_row,
                     )
-                else:
-                    # Real trading mode
-                    if has_open_position():
-                        print("  -> Existing REAL position detected, skip new order.")
-                    else:
-                        print("  -> Sending REAL order...")
-                        send_order(
-                            result["direction"],
-                            lot_real,
-                            result["entry_price"],
-                            result["sl_price"],
-                            result["tp_price"],
-                        )
 
             time.sleep(5)
 
@@ -866,12 +830,6 @@ def main_loop():
         except Exception as e:
             print("[ERROR] Exception in main loop:", e)
             time.sleep(10)
-
-    # Kalau ada sim trade, save ke CSV
-    if DRY_RUN and len(sim_trades) > 0:
-        df_sim = pd.DataFrame(sim_trades)
-        df_sim.to_csv("dl_live_sim_trades.csv", index=False)
-        print("[SIM] Saved sim trades -> dl_live_sim_trades.csv")
 
     mt5.shutdown()
     print("[INFO] MT5 shutdown.")
