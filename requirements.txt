@@ -1,16 +1,27 @@
+# === Core ===
 numpy
 pandas
 pandas_ta
+python-dateutil
+pytz
+joblib
+configparser
+matplotlib
+
+# === Machine Learning ===
 scikit-learn
 imbalanced-learn
-joblib
-matplotlib
-MetaTrader5
-pytz
-python-dateutil
-configparser
+xgboost
 
-# Deep Learning (LSTM / TensorFlow-based models)
-torch               # penting, karena kamu pakai torch LSTM
-torchaudio          # optional (boleh hapus kalau nggak perlu)
-torchvision         # optional (boleh hapus kalau nggak perlu)
+# === Deep Learning (LSTM / PyTorch) ===
+torch
+torchaudio     # optional (boleh hapus kalau size mau kecil)
+torchvision    # optional
+
+# === Trading & MT5 Integration ===
+MetaTrader5
+
+# === Optional (jika ingin web API / dashboard logger) ===
+# fastapi
+# uvicorn
+# requests
