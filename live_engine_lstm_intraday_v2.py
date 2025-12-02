@@ -1,36 +1,5 @@
 # live_engine_hybrid_intraday.py
-#
-# HYBRID Intraday Live Engine (LSTM + XGB, XAUUSD M15)
-#
-# - Connect MT5
-# - Ambil M15/H1/D1
-# - Bangun fitur (features_intraday: add_m15_features, add_h1_context, add_daily_context)
-# - LSTM inference  -> dl_proba_up
-# - XGB inference   -> xgb_proba_up
-# - Hybrid combine  -> hybrid_proba_up, hybrid_signal, hybrid_conf_group
-# - Apply:
-#     * Proba confidence filter (hybrid)
-#     * Regime filter (ATR MA + ADX + Session)
-#     * MTF trend filter (H1 EMA 50/200)
-#     * Dynamic TP (RR based on ADX + MTF trend + hybrid strength)
-#     * Dynamic risk (ADX + drawdown throttle + hybrid strength)
-# - Hitung lot dinamis & kirim order (kalau DRY_RUN=False)
-#
-# NOTE:
-#   - Butuh:
-#       from features_intraday import add_m15_features, add_h1_context, add_daily_context
-#   - Butuh NPZ LSTM:
-#       dl_intraday_dataset_seq*.npz  (feature_names, feat_mean, feat_std, seq_len)
-#   - Butuh NPZ XGB:
-#       xgb_intraday_meta.npz         (xgb_feature_names)
-#   - Config utama di dl_live_config.ini
-#
-#   ❗ Hybrid weighting & confidence threshold HARUS disamain dengan versi backtest hybrid lu
-#   kalau mau hasilnya mirip. Di sini gue set default:
-#       HYB_LSTM_WEIGHT = 0.6
-#       HYB_XGB_WEIGHT  = 0.4
-#       HYB_CONF_STRONG   = 0.30
-#       HYB_CONF_MODERATE = 0.20
+# (updated: DRY_RUN now simulates opening positions & closing on SL/TP/TIME per M15 bars)
 
 import time
 from datetime import datetime
@@ -167,6 +136,13 @@ H1_EMA_SLOW   = 200
 
 # Proba filter di level HYBRID (bukan per model)
 USE_HYB_CONF_FILTER = True
+
+# ====== SIMULATION STATE (DRY_RUN) ======
+SIM_START_BALANCE = cfg["SIM"].getfloat("SIM_START_BALANCE", 100.0) if "SIM" in cfg else 100.0
+sim_balance = SIM_START_BALANCE
+sim_peak_balance = SIM_START_BALANCE
+sim_position = None       # dict posisi virtual open
+sim_trades: list[dict] = []
 
 # ====== MODEL DEF ======
 
@@ -486,94 +462,141 @@ def calculate_dynamic_lot(sl_dist: float, last_row: pd.Series, dd_frac: float, c
     return lot
 
 
-def send_order(direction: str, volume: float, entry_price: float, sl_price: float, tp_price: float):
-    if direction == "LONG":
-        order_type = mt5.ORDER_TYPE_BUY
-        price = entry_price
-    else:
-        order_type = mt5.ORDER_TYPE_SELL
-        price = entry_price
+# ========== SIMULATION HELPERS (DRY_RUN) ==========
 
-    request = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": SYMBOL,
-        "volume": volume,
-        "type": order_type,
-        "price": price,
-        "sl": sl_price,
-        "tp": tp_price,
-        "deviation": 50,
-        "magic": MAGIC_NUMBER,
-        "comment": "HYBRID_INTRADAY_V1",
-        "type_filling": mt5.ORDER_FILLING_IOC,
-    }
+def open_sim_position(direction_str: str, entry_price: float,
+                      sl_price: float, tp_price: float,
+                      sl_dist: float, last_row: pd.Series,
+                      conf_group: str):
+    """
+    Buka posisi virtual (hanya dipakai ketika DRY_RUN=True).
+    Risk & lot pakai dynamic risk yang sama dengan backtest,
+    tapi basis-nya sim_balance + sim_peak_balance.
+    """
+    global sim_position, sim_balance, sim_peak_balance
 
-    if DRY_RUN:
-        print("[DRY_RUN] Order not sent. Request would be:")
-        print(" ", request)
+    if sim_position is not None:
+        print("[SIM] Sudah ada posisi virtual open, skip open baru.")
         return
 
-    result = mt5.order_send(request)
-    print("[ORDER]", result)
-    if result.retcode != mt5.TRADE_RETCODE_DONE:
-        print("[WARN] Order failed:", result.retcode)
+    if sl_dist <= 0:
+        print("[SIM] SL distance <= 0, skip sim trade.")
+        return
+
+    # Drawdown simulasi
+    if sim_peak_balance > 0:
+        dd_frac_sim = (sim_balance - sim_peak_balance) / sim_peak_balance
+    else:
+        dd_frac_sim = 0.0
+
+    # Risk% dinamis (pakai ADX + DD sim + hybrid conf)
+    risk_pct = get_risk_pct_for_row(last_row, dd_frac_sim, conf_group)
+    if risk_pct <= 0:
+        print("[SIM] Risk pct <= 0 (WEAK or throttled), skip.")
+        return
+
+    risk_amount = sim_balance * risk_pct
+    raw_lot = risk_amount / (sl_dist * CONTRACT_SIZE)
+    lot = clamp_lot_to_symbol(raw_lot)
+
+    if lot <= 0:
+        print("[SIM] Lot <= 0, skip sim trade.")
+        return
+
+    sim_position = {
+        "direction": direction_str,   # "LONG" / "SHORT"
+        "entry_price": entry_price,
+        "sl_price": sl_price,
+        "tp_price": tp_price,
+        "lot": lot,
+        "open_time": datetime.utcnow(),  # bisa diganti last_row["time"] kalau mau candle time
+        "balance_before": sim_balance,
+        "conf_group": conf_group,
+        "sl_dist": sl_dist,
+    }
+
+    print(f"[SIM] Open {direction_str} {lot:.3f} @ {entry_price:.2f} SL={sl_price:.2f} TP={tp_price:.2f}")
 
 
-# =========== FEATURE BUILDER LIVE ==========
-
-def build_features_for_m15(df_m15_raw: pd.DataFrame) -> pd.DataFrame:
+def update_sim_position_with_bar(last_bar: pd.Series):
     """
-    Live version of offline pipeline:
-      - M15 -> add_m15_features
-      - + H1 -> add_h1_context
-      - + D1 -> add_daily_context
-      - + ADX_14
-      - + ATR_MA_50
-      - + MTF trend (H1 EMA 50/200)
+    Dipanggil setiap M15 bar close (hanya kalau DRY_RUN=True).
+    Cek apakah bar ini menyentuh SL/TP posisi virtual.
     """
-    df_m15 = df_m15_raw.copy().sort_values("time").reset_index(drop=True)
+    global sim_position, sim_balance, sim_peak_balance, sim_trades
 
-    df_h1 = get_latest_h1_df(n_bars=300)
-    df_d1 = get_latest_d1_df(n_bars=200)
+    if sim_position is None:
+        return
 
-    df_feat = add_m15_features(df_m15)
-    df_feat = add_h1_context(df_feat, df_h1)
-    df_feat = add_daily_context(df_feat, df_d1)
+    high = float(last_bar["high"])
+    low = float(last_bar["low"])
+    time_bar = last_bar["time"]
 
-    df_feat = df_feat.sort_values("time").reset_index(drop=True)
+    direction = sim_position["direction"]
+    entry = sim_position["entry_price"]
+    sl = sim_position["sl_price"]
+    tp = sim_position["tp_price"]
+    lot = sim_position["lot"]
 
-    # ADX 14 (kalau belum ada)
-    if ADX_COL not in df_feat.columns:
-        adx = ta.adx(df_feat["high"], df_feat["low"], df_feat["close"], length=14)
-        df_feat[ADX_COL] = adx["ADX_14"]
+    exit_price = None
+    exit_reason = None
 
-    # ATR MA 50 untuk regime filter
-    if ATR_COL not in df_feat.columns:
-        raise ValueError(f"{ATR_COL} tidak ada di live features")
-    df_feat["atr_ma_50"] = df_feat[ATR_COL].rolling(ATR_MA_PERIOD).mean()
+    # check SL/TP touched within bar (worst-case price movement)
+    if direction == "LONG":
+        if low <= sl:
+            exit_price = sl
+            exit_reason = "SL"
+        elif high >= tp:
+            exit_price = tp
+            exit_reason = "TP"
+    else:  # SHORT
+        if high >= sl:
+            exit_price = sl
+            exit_reason = "SL"
+        elif low <= tp:
+            exit_price = tp
+            exit_reason = "TP"
 
-    # MTF trend H1 (EMA fast/slow dari resample M15)
-    if USE_MTF_FILTER:
-        df_tmp = df_feat.set_index("time")
-        df_h1_trend = df_tmp["close"].resample("1h").last().dropna().to_frame("close")
-        df_h1_trend["ema_fast"] = df_h1_trend["close"].ewm(span=H1_EMA_FAST, adjust=False).mean()
-        df_h1_trend["ema_slow"] = df_h1_trend["close"].ewm(span=H1_EMA_SLOW, adjust=False).mean()
-        diff = df_h1_trend["ema_fast"] - df_h1_trend["ema_slow"]
+    # if not touched -> keep position open (we exit only when SL/TP hit in sim)
+    if exit_price is None:
+        return
 
-        df_h1_trend[MTF_TREND_COL] = 0
-        df_h1_trend.loc[diff > 0, MTF_TREND_COL] = 1
-        df_h1_trend.loc[diff < 0, MTF_TREND_COL] = -1
+    # hitung PnL
+    direction_sign = 1 if direction == "LONG" else -1
+    price_move = (exit_price - entry) * direction_sign
+    gross_pnl = price_move * CONTRACT_SIZE * lot
 
-        df_feat["time_h1"] = df_feat["time"].dt.floor("h")
-        df_feat = df_feat.merge(
-            df_h1_trend[[MTF_TREND_COL]],
-            left_on="time_h1",
-            right_index=True,
-            how="left",
-        )
+    cost_per_001 = EST_COST_PER_TRADE_001
+    total_cost = cost_per_001 * (lot / 0.01)
 
-    df_feat = df_feat.dropna().reset_index(drop=True)
-    return df_feat
+    net_pnl = gross_pnl - total_cost
+
+    balance_before = sim_balance
+    sim_balance = max(0.0, sim_balance + net_pnl)
+    sim_peak_balance = max(sim_peak_balance, sim_balance)
+
+    trade = {
+        "direction": direction,
+        "entry_price": entry,
+        "exit_price": exit_price,
+        "sl_price": sim_position["sl_price"],
+        "tp_price": sim_position["tp_price"],
+        "lot": lot,
+        "open_time": sim_position["open_time"],
+        "close_time": time_bar,
+        "gross_pnl": gross_pnl,
+        "cost": total_cost,
+        "net_pnl": net_pnl,
+        "balance_before": balance_before,
+        "balance_after": sim_balance,
+        "exit_reason": exit_reason,
+        "conf_group": sim_position.get("conf_group"),
+        "sl_dist": sim_position.get("sl_dist"),
+    }
+    sim_trades.append(trade)
+
+    print(f"[SIM] Close {direction} @ {exit_price:.2f} ({exit_reason}), PnL={net_pnl:.2f}, Bal={sim_balance:.2f}")
+    sim_position = None
 
 
 # =============== INFERENCE =================
@@ -677,6 +700,11 @@ def build_hybrid_signal(dl_proba_up: float, xgb_proba_up: float, bid: float, ask
 
         direction = 1 if filtered_signal == 1 else -1
         rr_tp = get_rr_tp_for_row(last_row, direction)
+        # apply hybrid RR boost for strong conf
+        if conf_group == "A_STRONG":
+            rr_tp = min(rr_tp + RR_BOOST_STRONG, 4.0)
+        elif conf_group == "B_MODERATE":
+            rr_tp = min(rr_tp + RR_BOOST_MODERATE, 4.0)
         tp_dist = rr_tp * sl_dist
 
         if filtered_signal == 1:
@@ -720,6 +748,7 @@ def main_loop():
     print(f"[INFO] Lot bounds: MIN_LOT={MIN_LOT}, MAX_LOT={MAX_LOT}")
     print(f"[INFO] Dynamic TP: BASE={RR_TP_BASE}, MED={RR_TP_MED_TREND}, STRONG={RR_TP_STRONG_TREND}, BOOST_STRONG={RR_BOOST_STRONG}")
     print(f"[INFO] Regime: ATR_MA_PERIOD={ATR_MA_PERIOD}, ADX_MIN={ADX_MIN}, Session={SESSION_START_HOUR}-{SESSION_END_HOUR}")
+    print(f"[SIM] Starting sim balance: {sim_balance:.2f} (DRY_RUN={DRY_RUN})")
 
     last_bar_time = None
 
@@ -734,18 +763,25 @@ def main_loop():
 
             # Deteksi bar baru (close M15)
             if last_bar_time is not None and current_bar_time == last_bar_time:
+                # still same bar -> update sim position with latest tick? we update on bar close only
                 time.sleep(5)
                 continue
 
             last_bar_time = current_bar_time
             print(f"\n[INFO] New M15 bar detected: {current_bar_time}")
 
-            # Update equity & peak equity
+            # Update equity & peak equity (REAL account)
             equity_now = get_account_equity()
             peak_equity = max(peak_equity, equity_now)
             dd_frac = (equity_now - peak_equity) / peak_equity if peak_equity > 0 else 0.0
 
             print(f"  Equity: {equity_now:.2f}, Peak: {peak_equity:.2f}, DD: {dd_frac*100:.2f}%")
+
+            # Update posisi SIMULASI (kalau DRY_RUN)
+            if DRY_RUN:
+                # feed the bar that just closed to sim updater
+                update_sim_position_with_bar(df_m15.iloc[-1])
+                print(f"  [SIM] Bal={sim_balance:.2f}, Peak={sim_peak_balance:.2f}")
 
             df_feat = build_features_for_m15(df_m15)
             if len(df_feat) < seq_len:
@@ -791,12 +827,15 @@ def main_loop():
                     time.sleep(5)
                     continue
 
-                lot = calculate_dynamic_lot(
-                    result["sl_dist"],
-                    last_row,
-                    dd_frac,
-                    result["hybrid_conf_group"],
-                )
+                # calculate lot using REAL equity when real; SIM equity when DRY_RUN
+                if DRY_RUN:
+                    # use sim_balance for lot sizing in paper mode
+                    # but calculate_dynamic_lot uses get_account_equity, so we compute manually similar logic
+                    dd_frac_sim = (sim_balance - sim_peak_balance) / sim_peak_balance if sim_peak_balance > 0 else 0.0
+                    lot = calculate_dynamic_lot(result["sl_dist"], last_row, dd_frac_sim, result["hybrid_conf_group"])
+                else:
+                    lot = calculate_dynamic_lot(result["sl_dist"], last_row, dd_frac, result["hybrid_conf_group"])
+
                 if lot <= 0:
                     print("  -> Calculated lot <= 0, skip trade.")
                     time.sleep(5)
@@ -809,18 +848,26 @@ def main_loop():
                 if has_open_position():
                     print("  -> Existing position detected, skip new order.")
                 else:
-                    print(
-                        "  -> DRY_RUN: would send HYBRID order now."
-                        if DRY_RUN
-                        else "  -> Sending HYBRID order..."
-                    )
-                    send_order(
-                        result["direction"],
-                        lot,
-                        result["entry_price"],
-                        result["sl_price"],
-                        result["tp_price"],
-                    )
+                    if DRY_RUN:
+                        print("  -> DRY_RUN: open simulated position now.")
+                        open_sim_position(
+                            result["direction"],
+                            result["entry_price"],
+                            result["sl_price"],
+                            result["tp_price"],
+                            result["sl_dist"],
+                            last_row,
+                            result["hybrid_conf_group"],
+                        )
+                    else:
+                        print("  -> Sending HYBRID order...")
+                        send_order(
+                            result["direction"],
+                            lot,
+                            result["entry_price"],
+                            result["sl_price"],
+                            result["tp_price"],
+                        )
 
             time.sleep(5)
 
@@ -830,6 +877,13 @@ def main_loop():
         except Exception as e:
             print("[ERROR] Exception in main loop:", e)
             time.sleep(10)
+
+    # Shutdown: save sim trades if any
+    if DRY_RUN and len(sim_trades) > 0:
+        df_sim = pd.DataFrame(sim_trades)
+        df_sim.to_csv("hybrid_live_sim_trades.csv", index=False)
+        print("[SIM] Saved sim trades -> hybrid_live_sim_trades.csv")
+        print(f"[SIM] Final sim balance: {sim_balance:.2f}")
 
     mt5.shutdown()
     print("[INFO] MT5 shutdown.")
