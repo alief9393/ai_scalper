@@ -731,6 +731,145 @@ def build_hybrid_signal(dl_proba_up: float, xgb_proba_up: float, bid: float, ask
         "decision_time": last_row["time"],
     }
 
+# ======= FEATURE BUILDER LIVE (paste this before main_loop) =======
+
+def build_features_for_m15(df_m15_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Live version of offline pipeline:
+      - M15 -> add_m15_features
+      - + H1 -> add_h1_context
+      - + D1 -> add_daily_context
+      - + ADX_14
+      - + ATR_MA_50
+      - + MTF trend (H1 EMA 50/200)
+    Requires: from features_intraday import add_m15_features, add_h1_context, add_daily_context
+    """
+    df_m15 = df_m15_raw.copy().sort_values("time").reset_index(drop=True)
+
+    # get H1 / D1 frames from MT5 helpers (these functions exist in the script)
+    df_h1 = get_latest_h1_df(n_bars=300)
+    df_d1 = get_latest_d1_df(n_bars=200)
+
+    # build features using your offline pipeline helpers
+    df_feat = add_m15_features(df_m15)
+    df_feat = add_h1_context(df_feat, df_h1)
+    df_feat = add_daily_context(df_feat, df_d1)
+
+    df_feat = df_feat.sort_values("time").reset_index(drop=True)
+
+    # ADX 14 (kalau belum ada)
+    if ADX_COL not in df_feat.columns:
+        adx = ta.adx(df_feat["high"], df_feat["low"], df_feat["close"], length=14)
+        # pandas_ta returns columns like ADX_14, +DI_14, -DI_14 — we keep ADX_14
+        df_feat[ADX_COL] = adx["ADX_14"]
+
+    # ATR MA 50 untuk regime filter
+    if ATR_COL not in df_feat.columns:
+        raise ValueError(f"{ATR_COL} tidak ada di live features")
+    df_feat["atr_ma_50"] = df_feat[ATR_COL].rolling(ATR_MA_PERIOD).mean()
+
+    # MTF trend H1 (EMA fast/slow dari resample M15)
+    if USE_MTF_FILTER:
+        df_tmp = df_feat.set_index("time")
+        df_h1_trend = df_tmp["close"].resample("1h").last().dropna().to_frame("close")
+        df_h1_trend["ema_fast"] = df_h1_trend["close"].ewm(span=H1_EMA_FAST, adjust=False).mean()
+        df_h1_trend["ema_slow"] = df_h1_trend["close"].ewm(span=H1_EMA_SLOW, adjust=False).mean()
+        diff = df_h1_trend["ema_fast"] - df_h1_trend["ema_slow"]
+
+        df_h1_trend[MTF_TREND_COL] = 0
+        df_h1_trend.loc[diff > 0, MTF_TREND_COL] = 1
+        df_h1_trend.loc[diff < 0, MTF_TREND_COL] = -1
+
+        df_feat["time_h1"] = df_feat["time"].dt.floor("h")
+        df_feat = df_feat.merge(
+            df_h1_trend[[MTF_TREND_COL]],
+            left_on="time_h1",
+            right_index=True,
+            how="left",
+        )
+
+    # drop rows with NaNs that could break inference
+    df_feat = df_feat.dropna().reset_index(drop=True)
+    return df_feat
+
+def send_order(direction: str, volume: float, entry_price: float, sl_price: float, tp_price: float):
+    """
+    Kirim order ke MT5. Memakai global config:
+      - SYMBOL, MAGIC_NUMBER, DRY_RUN
+    Jika DRY_RUN True: cuma print request.
+    Volume diasumsikan sudah di-clamp (clamp_lot_to_symbol).
+    """
+    # safety checks
+    if volume is None or volume <= 0:
+        print("[WARN] send_order: volume invalid:", volume)
+        return None
+
+    if SYMBOL_INFO is None:
+        try:
+            # try to refresh symbol info once
+            si = mt5.symbol_info(SYMBOL)
+            if si is None:
+                print(f"[WARN] send_order: symbol {SYMBOL} not available in MT5.")
+                return None
+        except Exception as e:
+            print("[WARN] send_order: symbol_info lookup failed:", e)
+            return None
+
+    if direction == "LONG":
+        order_type = mt5.ORDER_TYPE_BUY
+        price = float(entry_price) if entry_price is not None else mt5.symbol_info_tick(SYMBOL).ask
+    elif direction == "SHORT":
+        order_type = mt5.ORDER_TYPE_SELL
+        price = float(entry_price) if entry_price is not None else mt5.symbol_info_tick(SYMBOL).bid
+    else:
+        print("[WARN] send_order: unknown direction:", direction)
+        return None
+
+    # Build request
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": SYMBOL,
+        "volume": float(volume),
+        "type": order_type,
+        "price": price,
+        "sl": float(sl_price) if sl_price is not None else 0.0,
+        "tp": float(tp_price) if tp_price is not None else 0.0,
+        "deviation": 50,              # allowed slippage in points (tweak if perlu)
+        "magic": MAGIC_NUMBER,
+        "comment": "LSTM_INTRADAY",
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+
+    if DRY_RUN:
+        # don't send — only log the request so DRY_RUN sim can use it
+        print("[DRY_RUN] Order not sent. Request would be:")
+        print(" ", request)
+        return {"retcode": "DRY_RUN", "request": request}
+
+    # send real order
+    try:
+        result = mt5.order_send(request)
+    except Exception as e:
+        print("[ERROR] send_order: mt5.order_send exception:", e)
+        return {"retcode": "EXCEPTION", "error": str(e)}
+
+    # result is a TradeResult object — log important fields
+    try:
+        retcode = getattr(result, "retcode", None)
+        print("[ORDER] retcode:", retcode)
+        print("  result:", result)
+        if retcode != mt5.TRADE_RETCODE_DONE:
+            # non-success — print info for debugging
+            print("[WARN] Order failed. retcode:", retcode)
+            try:
+                print("  comment:", result.comment)
+                print("  volume:", getattr(result, "volume", None))
+            except Exception:
+                pass
+        return result
+    except Exception as e:
+        print("[ERROR] send_order: unable to parse result:", e)
+        return {"retcode": "UNKNOWN_RESULT", "raw": result}
 
 # =============== MAIN LOOP =================
 
